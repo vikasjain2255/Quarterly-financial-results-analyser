@@ -1,2 +1,2 @@
-# Quarterly Results Analyser V4.2
-V4.2 fixes table selection. AUTO prefers consolidated when both standalone and consolidated result tables exist. Explicit CONSOLIDATED/STANDALONE selection is enforced. EBITDA is calculated as PBT + Finance Costs + Depreciation - Other Income when EBITDA is not explicitly reported.
+# Quarterly Results Analyser V4.3
+V4.3 selects the actual financial-results page instead of slicing the entire filing by a fragile text position. It recognizes both 'Unaudited Consolidated Financial Results' and 'Consolidated Unaudited Financial Results', and the corresponding standalone variants. Explicit CONSOLIDATED/STANDALONE selection is enforced; AUTO prefers consolidated. It also recognizes PDF extraction variants such as 'Depreciation I Amortisation Expense' and derives EBITDA as PBT + Finance Costs + Depreciation - Other Income when EBITDA is not reported.
