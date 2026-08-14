@@ -77,22 +77,35 @@ def heading_match(text,basis):
 def select_section(pages,basis):
     cons=[i for i,p in enumerate(pages) if heading_match(p,"CONSOLIDATED")]
     stand=[i for i,p in enumerate(pages) if heading_match(p,"STANDALONE")]
+
     if basis=="CONSOLIDATED":
         if not cons: raise ValueError("Consolidated financial-results table was not found.")
-        idx=cons[-1]; return pages[idx], "CONSOLIDATED", idx+1
-    if basis=="STANDALONE":
+        idx=cons[-1]; actual="CONSOLIDATED"
+    elif basis=="STANDALONE":
         if not stand: raise ValueError("Standalone financial-results table was not found.")
-        idx=stand[-1]; return pages[idx], "STANDALONE", idx+1
-    if cons:
-        idx=cons[-1]; return pages[idx], "CONSOLIDATED", idx+1
-    if stand:
-        idx=stand[-1]; return pages[idx], "STANDALONE", idx+1
-    # Fallback: locate "consolidated" / "standalone" financial result wording loosely.
-    for typ in ("CONSOLIDATED","STANDALONE"):
-        hits=[i for i,p in enumerate(pages) if re.search(rf"{typ.lower()}.*financial\s+results|financial\s+results.*{typ.lower()}",norm(p).lower())]
-        if hits:
-            idx=hits[-1]; return pages[idx],typ,idx+1
-    raise ValueError("Could not identify a standalone or consolidated financial-results table.")
+        idx=stand[-1]; actual="STANDALONE"
+    elif cons:
+        idx=cons[-1]; actual="CONSOLIDATED"
+    elif stand:
+        idx=stand[-1]; actual="STANDALONE"
+    else:
+        for typ in ("CONSOLIDATED","STANDALONE"):
+            hits=[i for i,p in enumerate(pages) if re.search(rf"{typ.lower()}.*financial\s+results|financial\s+results.*{typ.lower()}",norm(p).lower())]
+            if hits:
+                idx=hits[-1]; actual=typ; break
+        else:
+            raise ValueError("Could not identify a standalone or consolidated financial-results table.")
+
+    # The heading is frequently on the auditor/report page and the actual
+    # statement begins on the next page. Include following pages until the
+    # other basis starts, or up to 4 pages. This fixes filings such as TI India.
+    stop_candidates=[]
+    for i in (cons+stand):
+        if i>idx and i not in stop_candidates: stop_candidates.append(i)
+    stop=min(stop_candidates) if stop_candidates else len(pages)
+    end=min(stop,idx+4)
+    section="\n\f\n".join(pages[idx:end])
+    return section,actual,idx+1
 
 def find_metric(section,metric):
     lines=[norm(x) for x in section.splitlines() if norm(x)]
@@ -110,7 +123,8 @@ def find_metric(section,metric):
     return max(candidates,key=lambda x:x[0])
 
 def metric(raw,factor):
-    if not raw: return {"current":None,"previous":None,"yoy":None,"qoq":None,"yoypct":None,"confidence":"LOW","source":""}
+    if not raw or len(raw[1])<3:
+        return {"current":None,"previous":None,"yoy":None,"qoq":None,"yoypct":None,"confidence":"LOW","source":""}
     cur,prev,yoy=[v*factor for v in raw[1][:3]]
     return {"current":cur,"previous":prev,"yoy":yoy,"qoq":growth(cur,prev),"yoypct":growth(cur,yoy),"confidence":("HIGH" if raw[0]>=120 else "MEDIUM"),"source":raw[2]}
 
@@ -136,6 +150,10 @@ def analyse(data,quarter,basis,use_ocr):
     raw={k:find_metric(section,k) for k in ALIASES}
     rev=metric(raw["revenue"],factor); pat=metric(raw["pat"],factor)
     ebitda=metric(raw["ebitda"],factor) if raw["ebitda"] else derive_ebitda(raw,factor)
+    # Defensive guard: every metric must be a dictionary before margin math.
+    if not isinstance(rev,dict): rev=metric(None,factor)
+    if not isinstance(ebitda,dict): ebitda=metric(None,factor)
+    if not isinstance(pat,dict): pat=metric(None,factor)
     mc=ebitda["current"]/rev["current"]*100 if ebitda["current"] is not None and rev["current"] not in (None,0) else None
     mp=ebitda["previous"]/rev["previous"]*100 if ebitda["previous"] is not None and rev["previous"] not in (None,0) else None
     my=ebitda["yoy"]/rev["yoy"]*100 if ebitda["yoy"] is not None and rev["yoy"] not in (None,0) else None
@@ -172,12 +190,12 @@ if st.button("ANALYSE",type="primary",width="stretch"):
         rows=[]
         for label,m in [("Revenue",r["revenue"]),("EBITDA",r["ebitda"]),("Net Profit",r["pat"])]:
             rows.append({"Metric":label,"Current ₹cr":m["current"],"Previous Q ₹cr":m["previous"],"YoY ₹cr":m["yoy"],"QoQ %":m["qoq"],"YoY %":m["yoypct"],"Confidence":m["confidence"]})
-        st.subheader("Calculation details"); st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+        st.subheader("Calculation details"); st.dataframe(pd.DataFrame(rows),width="stretch",hide_index=True)
         if r["warnings"]:
             with st.expander("⚠ Review warnings",expanded=True):
                 for w in r["warnings"]: st.warning(w)
         with st.expander("🔎 Extraction diagnostics"):
-            st.write("Company:",r["company"]); st.write("Selected basis:",r["basis"]); st.write("Selected PDF page:",r["page"]); st.write("Unit:",r["unit"])
+            st.write("Company:",r["company"]); st.write("Selected basis:",r["basis"]); st.write("Selected financial-results section starts on PDF page:",r["page"]); st.write("Unit:",r["unit"])
             for k,raw in r["diagnostics"].items():
                 st.markdown(f"**{k.upper()}**"); st.code(str(raw[2]) if raw else "Not found")
         st.download_button("Download JSON",json.dumps(r,indent=2,default=str),file_name="results_analysis_v4_3.json",mime="application/json")
