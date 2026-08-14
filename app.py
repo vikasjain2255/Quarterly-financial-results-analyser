@@ -8,12 +8,28 @@ st.title("📊 Quarterly Results Analyser V4.3")
 st.caption("Quarterly-results PDF analyser — robust standalone/consolidated table selection.")
 
 ALIASES={
-"revenue":[r"revenue\s+from\s+operations",r"net\s+sales",r"total\s+sales",r"turnover",r"total\s+revenue"],
+"revenue":[
+ r"total\s+revenue\s+from\s+operations",
+ r"total\s+revenue",
+ r"revenue\s+from\s+operations",
+ r"revenue\s+from\s+contracts\s+with\s+customers"
+],
 "other_income":[r"other\s+income"],
-"pbt":[r"profit\s+before\s+exceptional\s+item\s*(?:&|and)?\s*tax",r"profit\s+before\s+tax",r"profit\s*/?\s*\(?loss\)?\s+before\s+tax",r"\bpbt\b"],
+"pbt":[
+ r"profit\s*/?\s*\(?loss\)?\s*before\s+tax\s*\(?7?\s*\+?\s*8?\)?",
+ r"profit\s*/?\s*\(?loss\)?\s+before\s+tax",
+ r"profit\s+before\s+exceptional\s+items?\s+and\s+tax",
+ r"profit\s+before\s+tax"
+],
 "finance_cost":[r"finance\s+costs?",r"interest\s+and\s+finance\s+costs?",r"interest\s+costs?"],
 "depreciation":[r"depreciation\s*(?:and|&|/|i)\s*amortisation",r"depreciation\s+and\s+amortization",r"depreciation"],
-"pat":[r"profit\s+for\s+the\s+period",r"net\s+profit\s*/?\s*\(?loss\)?\s+for\s+the\s+period",r"profit\s+after\s+tax",r"net\s+profit\s+after\s+tax",r"net\s+profit",r"profit\s+attributable\s+to.*owners"],
+"pat":[
+ r"total\s+profit\s*/?\s*\(?loss\)?",
+ r"profit\s*/?\s*\(?loss\)?\s+after\s+tax",
+ r"profit\s+for\s+the\s+period",
+ r"net\s+profit\s+after\s+tax",
+ r"net\s+profit"
+],
 "ebitda":[r"\bebitda\b",r"earnings\s+before\s+interest.*tax.*depreciation.*amortisation"]
 }
 NUMBER=re.compile(r"(?<![\w.])\(?-?\d[\d,]*(?:\.\d+)?\)?(?![\w.])")
@@ -111,14 +127,28 @@ def find_metric(section,metric):
     lines=[norm(x) for x in section.splitlines() if norm(x)]
     candidates=[]
     for i,line in enumerate(lines):
-        if any(re.search(p,line,re.I) for p in ALIASES[metric]):
-            for span in (1,2,3):
-                w=" ".join(lines[i:i+span])
-                vals=nums(w)
-                if len(vals)>=3:
-                    # Financial statement row should normally contain 4 columns.
-                    score=100-(span-1)*10+(25 if len(vals)==4 else 0)
-                    candidates.append((score,vals[:4],w)); break
+        matched=[]
+        for rank,p in enumerate(ALIASES[metric]):
+            if re.search(p,line,re.I):
+                matched.append(rank)
+        if not matched: continue
+
+        # Prefer numbers on the same line first. PDF extraction often puts
+        # table labels and values on separate visual columns/lines, so we
+        # also inspect the next few lines, but penalise wider spans.
+        for span in (1,2,3,4,5):
+            w=" ".join(lines[i:i+span])
+            vals=nums(w)
+            if len(vals)>=3:
+                label_rank=min(matched)
+                score=220-label_rank*25-(span-1)*18
+                # Four values is the standard Q/Q/YoY/FY pattern.
+                if len(vals)==4: score+=50
+                # Explicit total rows are preferred over component rows.
+                if re.search(r"\\btotal\\b",line,re.I): score+=70
+                # Avoid accidentally using a neighbouring expense/segment row.
+                candidates.append((score,vals[:4],w))
+                break
     if not candidates: return None
     return max(candidates,key=lambda x:x[0])
 
@@ -126,7 +156,13 @@ def metric(raw,factor):
     if not raw or len(raw[1])<3:
         return {"current":None,"previous":None,"yoy":None,"qoq":None,"yoypct":None,"confidence":"LOW","source":""}
     cur,prev,yoy=[v*factor for v in raw[1][:3]]
-    return {"current":cur,"previous":prev,"yoy":yoy,"qoq":growth(cur,prev),"yoypct":growth(cur,yoy),"confidence":("HIGH" if raw[0]>=120 else "MEDIUM"),"source":raw[2]}
+    q=growth(cur,prev); y=growth(cur,yoy)
+    confidence="HIGH" if raw[0]>=200 else "MEDIUM"
+    # A row with implausible growth is usually a column/row extraction error.
+    # Do not silently publish it as a headline number.
+    if (q is not None and abs(q)>1000) or (y is not None and abs(y)>1000):
+        confidence="LOW"
+    return {"current":cur,"previous":prev,"yoy":yoy,"qoq":q,"yoypct":y,"confidence":confidence,"source":raw[2]}
 
 def derive_ebitda(raw,factor):
     keys=["pbt","finance_cost","depreciation","other_income"]
@@ -138,8 +174,8 @@ def company_name(section):
     # Prefer an explicit legal/company-name line.
     for line in section.splitlines()[:35]:
         s=norm(line)
-        if re.search(r"\b(EURO\s+PANEL|LIMITED|LTD\.?|INDUSTRIES|BANK|FINANCE|STEEL|CEMENT|PHARMA|FOODS)\b",s,re.I):
-            if len(s)<100 and "financial results" not in s.lower() and "registered" not in s.lower():
+        if re.search(r"\b(TUBE\s+INVESTMENTS|EURO\s+PANEL|LIMITED|LTD\.?|INDUSTRIES|BANK|FINANCE|STEEL|CEMENT|PHARMA|FOODS)\b",s,re.I):
+            if len(s)<100 and "financial results" not in s.lower() and "registered" not in s.lower() and "finance costs" not in s.lower():
                 return s.upper()
     return "COMPANY"
 
@@ -158,6 +194,9 @@ def analyse(data,quarter,basis,use_ocr):
     mp=ebitda["previous"]/rev["previous"]*100 if ebitda["previous"] is not None and rev["previous"] not in (None,0) else None
     my=ebitda["yoy"]/rev["yoy"]*100 if ebitda["yoy"] is not None and rev["yoy"] not in (None,0) else None
     warnings=[f"{x} could not be extracted." for x,m in [("REVENUE",rev),("EBITDA",ebitda),("PAT",pat)] if m["current"] is None]
+    for label,m in [("REVENUE",rev),("EBITDA",ebitda),("PAT",pat)]:
+        if m["confidence"]=="LOW" and m["current"] is not None:
+            warnings.append(f"{label} extraction looks unreliable; please review the diagnostic source row.")
     if ocr: warnings.append(f"OCR used on {ocr} page(s).")
     return {"company":company_name(section),"quarter":quarter,"basis":actual,"page":page,"unit":unit,"revenue":rev,"ebitda":ebitda,"pat":pat,"margin_current":mc,"margin_previous":mp,"margin_yoy":my,"warnings":warnings,"diagnostics":raw}
 

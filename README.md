@@ -1,2 +1,2 @@
-# Quarterly Results Analyser V4.4
-V4.4 fixes a critical multi-page filing issue: the auditor heading and the actual financial-results table can be on different PDF pages. The selected basis section now includes subsequent pages up to the next standalone/consolidated section (maximum four pages). It also defensively prevents NoneType margin errors. AUTO prefers consolidated; explicit basis selection is enforced. EBITDA can be derived as PBT + Finance Costs + Depreciation - Other Income.
+# Quarterly Results Analyser V4.5
+V4.5 improves financial-row extraction. It prioritizes explicit total rows such as Total Revenue from Operations and Total Profit/(Loss), penalizes cross-line contamination, recognizes PDF extraction variants, and flags implausible growth instead of silently publishing bad numbers. Consolidated/standalone selection remains multi-page aware.
