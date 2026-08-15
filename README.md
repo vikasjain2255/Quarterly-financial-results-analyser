@@ -1,2 +1,2 @@
-# Quarterly Results Analyser V4.5
-V4.5 improves financial-row extraction. It prioritizes explicit total rows such as Total Revenue from Operations and Total Profit/(Loss), penalizes cross-line contamination, recognizes PDF extraction variants, and flags implausible growth instead of silently publishing bad numbers. Consolidated/standalone selection remains multi-page aware.
+# Quarterly Results Analyser V5
+V5 reconstructs PDF tables from word coordinates rather than relying only on text proximity. It supports direct PDF URLs/uploads, consolidated/standalone selection, multi-page sections, metric-specific row scoring, EBITDA derivation, validation warnings, reconstructed-table diagnostics and JSON export.
