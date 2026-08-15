@@ -1,222 +1,1021 @@
-import re,json,urllib.request
+
+import io, json, re, urllib.request
+from dataclasses import dataclass, asdict
+from typing import Optional, List, Dict, Tuple
+
 import streamlit as st
 import pandas as pd
 import pymupdf
 
-st.set_page_config(page_title="Quarterly Results Analyser V5.5",page_icon="📊",layout="wide")
-st.title("📊 Quarterly Results Analyser V5.5")
-st.caption("Header-anchored financial-table reconstruction • controlled OCR repair")
 
-PAT={
-"revenue":[r"total\s+revenue\s+from\s+operations",r"revenue\s+from\s+operations",r"revenue\s+from\s+contracts?\s+with\s+customers",r"total\s+revenue",r"net\s+sales",r"total\s+sales",r"turnover"],
-"other_income":[r"other\s+income"],"finance_cost":[r"finance\s+costs?",r"interest\s+and\s+finance\s+costs?"],
-"depreciation":[r"depreciation\s*(?:and|&)\s*amortisation",r"depreciation\s+and\s+amortization",r"depreciation"],
-"pbt":[r"profit\s*/?\s*\(?loss\)?\s+before\s+tax",r"profit\s+before\s+tax",r"\bpbt\b"],
-"pat":[r"profit\s*/?\s*\(?loss\)?\s+for\s+the\s+period",r"profit\s*/?\s*\(?loss\)?\s+for\s+the\s+year",r"net\s+profit\s+after\s+tax",r"net\s+profit",r"profit\s+attributable\s+to.*owners"],
-"ebitda":[r"\bebitda\b",r"earnings\s+before\s+interest.*depreciation.*amort"]
+# ============================================================
+# QUARTERLY FINANCIAL RESULTS ANALYSER — FINAL
+# ============================================================
+# Design principles:
+# 1. Select the actual financial-results statement first.
+# 2. Never mix standalone and consolidated pages.
+# 3. Use the table's declared four-period order.
+# 4. Extract only rows belonging to the selected statement.
+# 5. Repair OCR conservatively and validate values before use.
+# 6. Never crash because a metric is missing.
+# ============================================================
+
+st.set_page_config(
+    page_title="Quarterly Financial Results Analyser",
+    page_icon="📊",
+    layout="wide",
+)
+
+NUM_TOKEN = re.compile(r"^[\(\[\{]?[0-9OoIlLSsBbGgZzQq,\.\-]+[\)\]\}]?$")
+YEAR_RE = re.compile(r"(?:19|20)\d{2}")
+
+METRIC_PATTERNS = {
+    "revenue": [
+        r"revenue\s+from\s+operations",
+        r"total\s+revenue\s+from\s+operations",
+        r"revenue\s+from\s+contracts?\s+with\s+customers",
+        r"net\s+sales",
+        r"total\s+sales",
+        r"turnover",
+    ],
+    "other_income": [r"other\s+[iIl]ncome"],
+    "finance_cost": [
+        r"finance\s+costs?",
+        r"interest\s+and\s+finance\s+costs?",
+    ],
+    "depreciation": [
+        r"depreciation\s*(?:and|&)\s*amortisation",
+        r"depreciation\s*/\s*amortisation",
+        r"depreciation\s+i\s+amortisation",
+        r"depreciation\s+and\s+amortization",
+    ],
+    "pbt": [
+        r"profit\s*/?\s*\(?loss\)?\s+before\s+tax",
+        r"profit\s+before\s+tax",
+    ],
+    "pat_total": [
+        r"profit\s*/?\s*\(?loss\)?\s+after\s+tax",
+        r"profit\s+for\s+t\s*he\s+period",
+        r"profit\s*/?\s*\(?loss\)?\s+for\s+the\s+period",
+    ],
+    "pat_owner": [
+        r"profit\s+attributable\s+to\s*:?$",
+        r"owners\s+of\s+the\s+company",
+        r"owners\s+ofthe\s+company",
+        r"profit\s+attributable\s+to\s+owners",
+    ],
+    "ebitda": [
+        r"\bebitda\b",
+        r"earnings\s+before\s+interest.*depreciation.*amort",
+    ],
 }
-OCR=str.maketrans({"O":"0","o":"0","I":"1","l":"1","|":"1","S":"5","s":"5","B":"8","G":"6","g":"6","Z":"2","z":"2","Q":"0","q":"9"})
 
-def norm(s): return re.sub(r"\s+"," ",str(s).replace("\u00a0"," ")).strip()
 
-def num(t):
-    t=str(t).strip().replace(",","")
-    neg=t.startswith("(") and t.endswith(")")
-    c=t.strip("()[]{}")
-    if not re.search(r"\d",c): return None,"NONE"
-    if re.fullmatch(r"\d+(?:\.\d+)?",c):
-        try:return (-1 if neg else 1)*float(c),"HIGH"
-        except:return None,"NONE"
-    if len(c)>18:return None,"NONE"
-    x=re.sub(r"[^0-9.\-]","",c.translate(OCR))
-    if not re.fullmatch(r"\d+(?:\.\d+)?",x):return None,"NONE"
-    try:
-        v=float(x)
-        return ((-v if neg else v),"REPAIRED") if abs(v)<=1e8 else (None,"NONE")
-    except:return None,"NONE"
+@dataclass
+class Metric:
+    name: str
+    current: Optional[float] = None
+    previous_q: Optional[float] = None
+    yoy: Optional[float] = None
+    qoq_pct: Optional[float] = None
+    yoy_pct: Optional[float] = None
+    confidence: str = "LOW"
+    source: str = ""
+    raw: Optional[List[str]] = None
 
-def pdfdata(url):
-    q=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
-    with urllib.request.urlopen(q,timeout=90) as r:b=r.read()
-    if not b.startswith(b"%PDF"):raise ValueError("URL did not return a PDF.")
-    return b
 
-def rows(page,ocr=False):
-    tp=page.get_textpage_ocr() if ocr else None
-    ws=page.get_text("words",textpage=tp,sort=True) if tp else page.get_text("words",sort=True)
-    rr=[]
-    for x0,y0,x1,y1,t,*_ in ws:
-        cy=(y0+y1)/2
-        r=next((z for z in rr if abs(z["y"]-cy)<=2.8),None)
-        it={"x":float(x0),"x1":float(x1),"text":str(t)}
-        if r:r["items"].append(it);r["y"]=(r["y"]+cy)/2
-        else:rr.append({"y":cy,"items":[it]})
-    for r in rr:
-        r["items"].sort(key=lambda x:x["x"])
-        r["text"]=norm(" ".join(x["text"] for x in r["items"]))
-        r["numbers"]=[]
-        for x in r["items"]:
-            v,c=num(x["text"])
-            if v is not None:r["numbers"].append({"value":v,"x":x["x"],"token":x["text"],"confidence":c})
-    return sorted(rr,key=lambda x:x["y"])
+def pct_change(cur, old):
+    if cur is None or old in (None, 0):
+        return None
+    return (cur / old - 1.0) * 100.0
 
-def text(page,ocr=False):
-    tp=page.get_textpage_ocr() if ocr else None
-    return page.get_text("text",textpage=tp,sort=True) if tp else page.get_text("text",sort=True)
 
-def choose(doc,basis,ocr):
-    ps=[]
-    for i,p in enumerate(doc):
-        t=text(p,ocr);l=t.lower();rs=rows(p,ocr)
-        lab=sum(any(re.search(x,l,re.I) for x in PAT[k]) for k in ["revenue","finance_cost","depreciation","pbt","pat"])
-        cons=len(re.findall("consolidated",l));stand=len(re.findall("standalone",l))
-        dense=sum(len(r["numbers"])>=2 for r in rs)
-        if lab>=2 and dense>=2:ps.append((i,t,rs,lab,cons,stand,dense))
-    if not ps:raise ValueError("Could not identify a financial-results table.")
-    def sc(p,w):
-        good=p[4] if w=="CONSOLIDATED" else p[5]
-        bad=p[5] if w=="CONSOLIDATED" else p[4]
-        return p[3]*40+p[6]*15+good*100-bad*70
-    if basis=="AUTO":
-        c=max(ps,key=lambda p:sc(p,"CONSOLIDATED"));s=max(ps,key=lambda p:sc(p,"STANDALONE"))
-        b="CONSOLIDATED" if sc(c,"CONSOLIDATED")>=sc(s,"STANDALONE") else "STANDALONE"
-    else:b=basis
-    p=max(ps,key=lambda p:sc(p,b))
-    start=p[0];end=start+1
-    return b,start,end,ps
+def numeric_candidates(token: str):
+    """
+    Return plausible numeric interpretations of one OCR token.
+    Multiple candidates are retained so the row-level validator can choose
+    the interpretation that best fits the neighbouring financial values.
+    """
+    if not token:
+        return []
 
-def header(rs):
-    best=None
-    for r in rs:
-        ds=[x for x in r["items"] if re.search(r"(?:19|20)\d{2}",x["text"]) or len(re.sub(r"\D","",x["text"]))>=6]
-        if len(ds)>=2 and re.search(r"particular|quarter|year|period|ended|s\.?no|no\.?",r["text"],re.I):
-            z=[(x["x"]+x["x1"])/2 for x in ds]
-            if len(z)>=2 and (best is None or len(z)>len(best[0])):best=(z,r["text"])
-    return best
+    raw = token.strip().replace(",", "").replace(" ", "")
+    if raw in {"-", "—", "–", "NA", "N/A", "na", "n/a"}:
+        return []
 
-def anchors(rs):
-    h=header(rs)
-    if h:return h[0][:4],"HEADER",h[1]
-    pts=[]
-    for r in rs:
-        if any(re.search(p,r["text"],re.I) for k in ["revenue","finance_cost","depreciation","pbt","pat"] for p in PAT[k]):
-            pts += [n["x"] for n in r["numbers"] if n["x"]>250]
-    pts.sort();cs=[]
-    for x in pts:
-        if not cs or x-cs[-1][-1]>14:cs.append([x])
-        else:cs[-1].append(x)
-    return sorted([sum(c)/len(c) for c in cs if len(c)>=2])[:4],"NUMERIC_FALLBACK",None
+    neg = raw.startswith("(") and raw.endswith(")")
+    raw = raw.strip("()[]{}")
 
-def maprow(r,a):
-    out=[None]*len(a)
-    for n in r["numbers"]:
-        if 1900<=n["value"]<=2100:continue
-        j=min(range(len(a)),key=lambda k:abs(n["x"]-a[k]))
-        d=abs(n["x"]-a[j])
-        if d<=30 and (out[j] is None or d<abs(out[j]["x"]-a[j])):out[j]=n
+    if re.fullmatch(r"\d+(?:\.\d+)?", raw):
+        v=float(raw)
+        return [-v if neg else v]
+
+    # OCR possibilities. The values are intentionally small and scoped to
+    # financial-number tokens; normal prose is rejected later by row context.
+    choices = {
+        "O":"0","o":"0","I":"1","l":"1","|":"1","t":"1","T":"1","L":"1",
+        "S":"5","s":"5","B":"8","b":"8","G":"6","g":"9","Z":"2","z":"2",
+        "Q":"0","q":"9","R":"8","r":"1","A":"8","a":"4","E":"3","e":"3",
+        "M":"44","m":"44","!":"1","?":"2","'":"7",
+    }
+
+    # A small beam rather than an uncontrolled combinatorial expansion.
+    variants = {raw}
+    for ch, rep in choices.items():
+        variants |= {v.replace(ch, rep) for v in list(variants) if ch in v}
+
+    # Common OCR hyphen inside a number is usually a decimal point.
+    expanded=set(variants)
+    for v in list(variants):
+        if "-" in v[1:]:
+            expanded.add(v.replace("-", ".", 1))
+    variants=expanded
+
+    results=[]
+    for v in variants:
+        # Remove OCR punctuation that is not useful.
+        v=re.sub(r"[^0-9.\-]", "", v)
+        if not v:
+            continue
+        if v.count(".")>1:
+            first=v.find(".")
+            v=v[:first+1]+v[first+1:].replace(".","")
+        if v.startswith("-") and v.count("-")>1:
+            continue
+
+        # If no decimal was printed, financial statements generally use
+        # two decimal places. Do not do this for very short integer tokens.
+        if "." not in v and re.fullmatch(r"\d{3,}",v):
+            v=v[:-2]+"."+v[-2:]
+
+        if re.fullmatch(r"\d+(?:\.\d+)?",v):
+            x=float(v)
+            if x<=1e10:
+                results.append(-x if neg else x)
+
+    # Unique, deterministic order.
+    return sorted(set(results))
+
+
+def clean_numeric_token(token: str):
+    vals=numeric_candidates(token)
+    return vals[0] if len(vals)==1 else (vals[0] if vals else None)
+
+
+def numeric_tokens(line: str) -> List[str]:
+    """
+    Extract complete numeric-looking tokens from one text line.
+    Words such as 'Profit' must never become numbers.
+    """
+    out = []
+    for tok in re.findall(r"\S+", line):
+        tok2 = tok.strip(",;:")
+        if NUM_TOKEN.fullmatch(tok2) and clean_numeric_token(tok2) is not None:
+            out.append(tok2)
     return out
 
-def metric(rs,key,a,f):
-    hits=[]
-    for r in rs:
-        if any(re.search(p,r["text"],re.I) for p in PAT[key]):
-            m=maprow(r,a)
-            if sum(x is not None for x in m)>=2:hits.append((sum(x is not None for x in m),r,m))
-    if not hits:return {"current":None,"previous":None,"yoy":None,"qoq":None,"yoypct":None,"confidence":"LOW","source":"","mapped":[],"mapped_x":[]}
-    _,r,m=max(hits,key=lambda x:(x[0],len(x[1]["numbers"])))
-    v=[x["value"]*f if x else None for x in m]
-    gr=lambda x,y:None if x is None or y in (None,0) else (x/y-1)*100
-    return {"current":v[0],"previous":v[1],"yoy":v[2] if len(v)>2 else None,
-            "qoq":gr(v[0],v[1]),"yoypct":gr(v[0],v[2] if len(v)>2 else None),
-            "confidence":"HIGH","source":r["text"],
-            "mapped":[x["token"] if x else None for x in m],
-            "mapped_x":[x["x"] if x else None for x in m]}
 
-def analyse(data,basis,ocr,q):
-    doc=pymupdf.open(stream=data,filetype="pdf")
-    b,s,e,profiles=choose(doc,basis,ocr)
-    rs=[]
-    for i in range(s,e):
-        for r in rows(doc[i],ocr):
-            r["page"]=i+1;rs.append(r)
-    section="\n".join(profiles[j][1] for j in range(len(profiles)) if s<=profiles[j][0]<e)
-    f=.01 if re.search(r"figures?\s+in\s+lakhs?|₹\s*lakhs?",section,re.I) else .1 if re.search(r"figures?\s+in\s+millions?|₹\s*millions?",section,re.I) else 1
-    unit="₹ crore (converted)" if f!=1 else "₹ crore"
-    a,src,hd=anchors(rs)
-    m={k:metric(rs,k,a,f) for k in PAT}
-    rev,eb,pat=m["revenue"],m["ebitda"],m["pat"]
-    if eb["current"] is None and all(m[k]["current"] is not None for k in ["pbt","finance_cost","depreciation","other_income"]):
-        v=[]
-        for ix in range(3):
-            z=[m[k]["current"] if ix==0 else m[k]["previous"] if ix==1 else m[k]["yoy"] for k in ["pbt","finance_cost","depreciation","other_income"]]
-            if any(x is None for x in z):break
-            v.append(z[0]+z[1]+z[2]-z[3])
-        if len(v)==3:
-            gr=lambda x,y:None if x is None or y in (None,0) else (x/y-1)*100
-            eb={"current":v[0],"previous":v[1],"yoy":v[2],"qoq":gr(v[0],v[1]),"yoypct":gr(v[0],v[2]),
-                "confidence":"DERIVED","source":"PBT + Finance Costs + Depreciation - Other Income","mapped":[],"mapped_x":[]}
-            m["ebitda"]=eb
-    warnings=[]
-    for lab,x in [("REVENUE",m["revenue"]),("EBITDA",m["ebitda"]),("PAT",m["pat"])]:
-        if x["current"] is None:warnings.append(f"{lab} could not be extracted.")
-        if x["qoq"] is not None and abs(x["qoq"])>500:warnings.append(f"{lab} has an unusually large QOQ change ({x['qoq']:.0f}%). Check period mapping.")
-    if len(a)!=4:warnings.append(f"{len(a)} column anchors detected; four-period mapping may be incomplete.")
-    if src!="HEADER":warnings.append("Header anchors were not detected; numeric fallback was used.")
-    name="COMPANY"
-    for line in text(doc[s]).splitlines():
-        z=norm(line)
-        if len(z)<100 and re.search(r"LIMITED|LTD|INDIA|INDUSTRIES|INVESTMENTS|TUBE",z,re.I) and not re.search("financial results|registered office",z,re.I):
-            name=z.upper();break
-    gr=lambda x,y:None if x is None or y in (None,0) else (x/y-1)*100
-    r={"company":name,"quarter":q,"basis":b,"start_page":s+1,"end_page":e,"unit":unit,
-       "anchor_source":src,"header":hd,"column_anchors":a,**m,
-       "margin_current":eb["current"]/rev["current"]*100 if eb["current"] is not None and rev["current"] not in (None,0) else None,
-       "margin_previous":eb["previous"]/rev["previous"]*100 if eb["previous"] is not None and rev["previous"] not in (None,0) else None,
-       "margin_yoy":eb["yoy"]/rev["yoy"]*100 if eb["yoy"] is not None and rev["yoy"] not in (None,0) else None,
-       "warnings":warnings,"diagnostic_rows":rs}
+def get_pdf(url: str) -> bytes:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/pdf,*/*",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=90) as r:
+        data = r.read()
+    if not data.startswith(b"%PDF"):
+        raise ValueError("The URL did not return a PDF. Please use the direct NSE PDF link.")
+    return data
+
+
+def page_text(page, force_ocr=False):
+    if force_ocr:
+        try:
+            tp = page.get_textpage_ocr()
+            return page.get_text("text", textpage=tp, sort=True)
+        except Exception:
+            pass
+    return page.get_text("text", sort=True)
+
+
+def detect_company(doc):
+    for page in doc:
+        for line in page_text(page).splitlines()[:20]:
+            s = " ".join(line.split()).strip()
+            if (
+                len(s) <= 120
+                and len(s) >= 4
+                and re.search(r"\b(LIMITED|LTD\.?|INDIA|INDUSTRIES|INVESTMENTS|PRODUCTS)\b", s, re.I)
+                and not re.search(r"REGISTERED|REGD|WEBSITE|EMAIL|CIN|PHONE|TELEPHONE", s, re.I)
+            ):
+                return re.sub(r"\s+", " ", s).upper()
+    return "COMPANY"
+
+
+def statement_pages(doc, desired_basis: str, force_ocr=False):
+    """
+    Find the actual statement page(s).
+    Explicit basis ALWAYS wins.
+    AUTO prefers consolidated when both are present.
+    """
+    candidates = []
+
+    for i, page in enumerate(doc):
+        t = page_text(page, force_ocr)
+        low = t.lower()
+
+        cons = bool(re.search(
+            r"(unaudited|audited)\s+consolidated\s+financial\s+results|"
+            r"consolidated\s+financial\s+results", low
+        ))
+        stand = bool(re.search(
+            r"(unaudited|audited)\s+standalone\s+financial\s+results|"
+            r"standalone\s+financial\s+results", low
+        ))
+
+        # Some PDFs have "Consolidated" and "Standalone" on separate lines.
+        if not cons and re.search(r"\bconsolidated\b", low) and re.search(r"\bfinancial results\b", low):
+            cons = True
+        if not stand and re.search(r"\bstandalone\b", low) and re.search(r"\bfinancial results\b", low):
+            stand = True
+
+        # A real results table must contain the financial-results heading AND
+        # the core revenue row. This prevents board notices/auditor reports
+        # from being mistaken for the actual statement.
+        has_results_table = bool(
+            re.search(r"revenue\s+from\s+operations|revenue\s+from\s+contracts", low)
+            and re.search(r"profit|expense|tax", low)
+        )
+
+        if cons and has_results_table:
+            candidates.append(("CONSOLIDATED", i, t))
+        if stand and has_results_table:
+            candidates.append(("STANDALONE", i, t))
+
+    def candidate_score(x):
+        basis0, page0, text0 = x
+        low0 = text0.lower()
+        score = 0
+        score += 100 if "quarter ended" in low0 else 0
+        score += 80 if "particulars" in low0 else 0
+        score += 80 if "revenue from operations" in low0 else 0
+        score += 50 if "profit before tax" in low0 else 0
+        score += 40 if "profit for the period" in low0 else 0
+        score += 30 if "finance costs" in low0 else 0
+        score += 20 if "depreciation" in low0 else 0
+        return score
+
+    if desired_basis == "CONSOLIDATED":
+        c = [x for x in candidates if x[0] == "CONSOLIDATED"]
+        if not c:
+            raise ValueError("No consolidated financial-results statement was found in this PDF.")
+        basis, start, t = max(c, key=candidate_score)
+    elif desired_basis == "STANDALONE":
+        c = [x for x in candidates if x[0] == "STANDALONE"]
+        if not c:
+            raise ValueError("No standalone financial-results statement was found in this PDF.")
+        basis, start, t = max(c, key=candidate_score)
+    else:
+        c = [x for x in candidates if x[0] == "CONSOLIDATED"]
+        s = [x for x in candidates if x[0] == "STANDALONE"]
+        if c:
+            basis, start, t = max(c, key=candidate_score)
+        elif s:
+            basis, start, t = max(s, key=candidate_score)
+        else:
+            raise ValueError("Could not identify a standalone or consolidated financial-results statement.")
+
+    # Include only the statement page and immediately following continuation
+    # pages until the next statement/balance-sheet section.
+    pages = [start]
+    for j in range(start + 1, min(start + 5, len(doc))):
+        tt = page_text(doc[j], force_ocr)
+        ll = tt.lower()
+        if re.search(r"balance sheet|cash flow statement|segment revenue|segment results", ll):
+            break
+        if re.search(r"standalone\s+financial\s+results|consolidated\s+financial\s+results", ll):
+            break
+        # A continuation page generally has financial-result line items.
+        if re.search(
+            r"profit|revenue|expense|tax|other comprehensive|earnings per share|particulars",
+            ll,
+        ):
+            pages.append(j)
+        else:
+            break
+
+    return basis, pages
+
+
+def detect_unit(text: str):
+    low = text.lower()
+    if re.search(r"\(\s*['₹]?\s*in\s+lakhs?\s*\)", low) or re.search(r"in lakhs", low):
+        return 0.01, "₹ crore (converted from lakhs)"
+    if re.search(r"in\s+millions?", low):
+        return 0.10, "₹ crore (converted from millions)"
+    if re.search(r"in\s+thousands?", low):
+        return 0.0001, "₹ crore (converted from thousands)"
+    return 1.0, "₹ crore"
+
+
+def find_header(lines):
+    """
+    Identify the declared four financial periods.
+    This is informational; the numerical order is the order printed in
+    the statement, not inferred from magnitudes.
+    """
+    for i, line in enumerate(lines):
+        if YEAR_RE.search(line) and (
+            "quarter" in line.lower()
+            or "year ended" in line.lower()
+            or "particulars" in line.lower()
+        ):
+            return i
+    return None
+
+
+def line_has_metric(line, metric):
+    low = re.sub(r"\s+", " ", line.strip().lower())
+    for p in METRIC_PATTERNS[metric]:
+        if re.search(p, low):
+            return True
+    return False
+
+
+def is_numeric_only(line):
+    toks = numeric_tokens(line)
+    stripped = line.strip()
+    if not toks:
+        return False
+    # A numeric-only row should contain no alphabetic words.
+    letters = re.sub(r"[\d\s,().\-\[\]{}.|]", "", stripped)
+    return len(letters) == 0
+
+
+def collect_row(lines, idx, max_forward=8):
+    """
+    Financial PDFs frequently extract a row label on one line and the four
+    numbers on the following lines. Collect numeric values without allowing
+    later unrelated rows to leak in.
+    """
+    label = lines[idx].strip()
+    vals = numeric_tokens(label)
+
+    # If the label line already contains all four numbers, use them.
+    if len(vals) >= 4:
+        return vals[:4], label
+
+    collected = list(vals)
+
+    for j in range(idx + 1, min(idx + 1 + max_forward, len(lines))):
+        nxt = lines[j].strip()
+
+        # Stop at a new textual row/section.
+        if not nxt:
+            continue
+
+        nums = numeric_tokens(nxt)
+
+        if nums and is_numeric_only(nxt):
+            collected.extend(nums)
+            if len(collected) >= 4:
+                return collected[:4], label
+            continue
+
+        # Some PDF extractors put label fragments before the numbers.
+        # Permit short continuation fragments only if they contain no
+        # financial-row keywords and no more than a few characters.
+        if not nums and len(nxt) < 35 and not re.search(
+            r"revenue|income|expense|profit|loss|tax|finance|depreciation|"
+            r"materials|employee|purchase|inventory|other|total|particulars|"
+            r"share|earnings|comprehensive|exceptional",
+            nxt,
+            re.I,
+        ):
+            continue
+
+        break
+
+    return (collected[:4] if len(collected) >= 4 else collected), label
+
+
+
+def merge_numeric_items(items):
+    """
+    Merge adjacent OCR fragments such as:
+      71 + S7 -> 71S7
+      1?R + 15 -> 1?R15
+    Only merge fragments that are very close horizontally.
+    """
+    out=[]
+    i=0
+    while i<len(items):
+        cur=items[i]
+        if i+1<len(items):
+            nxt=items[i+1]
+            gap=nxt["x"]-cur["x1"]
+            if gap<=3.5 and (
+                NUM_TOKEN.fullmatch(cur["text"].strip(",:;"))
+                or re.search(r"\d",cur["text"])
+            ) and (
+                NUM_TOKEN.fullmatch(nxt["text"].strip(",:;"))
+                or re.search(r"\d",nxt["text"])
+            ):
+                cur={"x":cur["x"],"x1":nxt["x1"],
+                     "text":cur["text"]+nxt["text"]}
+                i+=1
+        out.append(cur)
+        i+=1
+    return out
+
+
+def choose_row_values(tokens):
+    """
+    Pick four values from OCR candidates using financial-table constraints.
+    The first three are current quarter / previous quarter / YoY quarter;
+    the fourth is FY and may be several times larger.
+    """
+    candidate_lists=[numeric_candidates(t) for t in tokens]
+    if len(candidate_lists)<4:
+        return None
+
+    # Keep the first four visual financial columns.
+    candidate_lists=candidate_lists[:4]
+    best=None
+
+    import itertools
+    for combo in itertools.product(*candidate_lists):
+        if len(combo)!=4:
+            continue
+        a,b,c,d=combo
+        if any(abs(x)>1e10 for x in combo):
+            continue
+        # The first three periods should normally be in the same order of
+        # magnitude. Allow extreme business moves, but strongly penalise
+        # impossible 10x/0.1x OCR interpretations.
+        score=0.0
+        for x,y in [(a,b),(a,c),(b,c)]:
+            if x==0 or y==0:
+                continue
+            ratio=max(abs(x/y),abs(y/x))
+            if ratio>12:
+                score-=50
+            else:
+                score-=abs(__import__("math").log10(ratio))*5
+
+        # FY is cumulative and can legitimately be larger than Q1.
+        if a!=0 and d!=0:
+            ratio=abs(d/a)
+            if ratio<0.25 or ratio>20:
+                score-=30
+
+        # Prefer values with two decimals.
+        for x in combo:
+            if abs(x-round(x,2))<1e-9:
+                score+=1
+
+        if best is None or score>best[0]:
+            best=(score,list(combo))
+    return best[1] if best else None
+
+
+def page_rows(doc, pages, force_ocr=False):
+    """
+    Reconstruct visual table rows from PDF word coordinates.
+    This is critical for NSE PDFs where text extraction is column-major:
+    labels may be emitted first and the four numerical columns afterwards.
+    """
+    rows = []
+    for pno in pages:
+        page = doc[pno]
+        try:
+            if force_ocr:
+                tp = page.get_textpage_ocr()
+                words = page.get_text("words", textpage=tp, sort=True)
+            else:
+                words = page.get_text("words", sort=True)
+        except Exception:
+            words = page.get_text("words", sort=True)
+
+        grouped = []
+        for w in words:
+            x0, y0, x1, y1, txt = w[:5]
+            cy = (y0 + y1) / 2
+            target = None
+            for g in grouped:
+                if abs(g["y"] - cy) <= 3.2:
+                    target = g
+                    break
+            item = {"x": float(x0), "x1": float(x1), "text": str(txt)}
+            if target is None:
+                grouped.append({"y": cy, "items": [item]})
+            else:
+                target["items"].append(item)
+                target["y"] = (target["y"] + cy) / 2
+
+        for g in grouped:
+            g["items"].sort(key=lambda z: z["x"])
+            g["items"] = merge_numeric_items(g["items"])
+            g["text"] = " ".join(x["text"] for x in g["items"])
+            g["numbers"] = []
+
+            # Financial columns start well to the right of the particulars
+            # column in NSE result tables.
+            financial_items=[x for x in g["items"] if x["x"]>300]
+            token_text=[x["text"] for x in financial_items]
+            chosen=choose_row_values(token_text) if len(token_text)>=4 else None
+
+            if chosen is not None:
+                for x,v in zip(financial_items[:4],chosen):
+                    if not (1900 <= v <= 2100):
+                        g["numbers"].append({
+                            "value": v,
+                            "x": x["x"],
+                            "token": x["text"],
+                        })
+            else:
+                for x in financial_items:
+                    vals=numeric_candidates(x["text"])
+                    if vals:
+                        v=vals[0]
+                        if not (1900 <= v <= 2100):
+                            g["numbers"].append({
+                                "value": v,
+                                "x": x["x"],
+                                "token": x["text"],
+                            })
+            g["page"] = pno + 1
+            rows.append(g)
+
+    return sorted(rows, key=lambda r: (r["page"], r["y"]))
+
+
+def extract_pat_owner(rows):
+    """Pick the Owners row immediately associated with 'Profit attributable to'."""
+    anchor_indices=[]
+    for i,r in enumerate(rows):
+        if re.search(r"profit\s+attributable\s+to", r["text"], re.I):
+            anchor_indices.append(i)
+    candidates=[]
+    for ai in anchor_indices:
+        for j in range(ai+1, min(ai+6, len(rows))):
+            r=rows[j]
+            if re.search(r"owners\s+of\s*the\s+compan", r["text"], re.I):
+                nums=[n for n in r["numbers"] if n["x"]>300]
+                if len(nums)>=4:
+                    candidates.append((j-ai, [n["value"] for n in nums[:4]], r["text"], [n["token"] for n in nums[:4]]))
+                break
+    if not candidates:
+        return None
+    _,vals,label,raw=min(candidates,key=lambda x:x[0])
+    return vals,label,raw
+
+def extract_metric_rows(rows, metric):
+    """
+    Primary extraction path. Match the metric label to the SAME VISUAL ROW
+    as its four numeric values. This prevents cross-row mixing of:
+      Revenue from Operations / Other Operating Revenue / Total Revenue.
+    """
+    candidates = []
+
+    for r in rows:
+        low = re.sub(r"\s+", " ", r["text"].strip().lower())
+        if not any(re.search(p, low) for p in METRIC_PATTERNS[metric]):
+            continue
+
+        nums = sorted(r["numbers"], key=lambda x: x["x"])
+
+        # Financial statement rows normally have exactly four period values.
+        # If there are more, take the four right-most/most plausible values.
+        if len(nums) >= 4:
+            # The financial columns in these NSE statements are to the right
+            # of the Particulars column. Ignore tiny left-side numbering.
+            nums = [n for n in nums if n["x"] > 300]
+            if len(nums) >= 4:
+                nums = nums[:4]
+                vals = [n["value"] for n in nums]
+                candidates.append((vals, r["text"], [n["token"] for n in nums], r["page"]))
+
+    if not candidates:
+        return None
+
+    def score(c):
+        label = c[1].lower()
+        score = 0
+        exact = {
+            "revenue": ["revenue from operations"],
+            "other_income": ["other income"],
+            "finance_cost": ["finance costs"],
+            "depreciation": ["depreciation and amortisation", "depreciation / amortisation"],
+            "pbt": ["profit before tax"],
+            "pat_total": ["profit for the period", "profit/(loss) after tax"],
+            "pat_owner": ["owners ofthe company", "owners of the company"],
+            "ebitda": ["ebitda"],
+        }
+        for phrase in exact.get(metric, []):
+            if phrase in label:
+                score += 50
+        if "segment" in label:
+            score -= 100
+        if "earnings per share" in label or "eps" in label:
+            score -= 100
+        return score
+
+    return max(candidates, key=score)
+
+
+def extract_metric(lines, metric):
+    candidates = []
+
+    for i, line in enumerate(lines):
+        if not line_has_metric(line, metric):
+            continue
+
+        vals, label = collect_row(lines, i)
+        if len(vals) >= 4:
+            parsed = [clean_numeric_token(x) for x in vals[:4]]
+            if all(x is not None for x in parsed):
+                candidates.append((parsed, label, vals))
+
+    if not candidates:
+        return None
+
+    # Prefer the most exact label and avoid a segment/notes row.
+    def score(c):
+        vals, label, raw = c
+        s = 0
+        if "revenue from operations" in label.lower(): s += 30
+        if "profit before tax" in label.lower(): s += 30
+        if "profit for the period" in label.lower(): s += 30
+        if "finance costs" in label.lower(): s += 30
+        if "depreciation" in label.lower(): s += 30
+        if "other income" in label.lower(): s += 30
+        if "segment" in label.lower(): s -= 100
+        if "eps" in label.lower(): s -= 100
+        return s
+
+    return max(candidates, key=score)
+
+
+def make_metric(name, extracted, factor):
+    if not extracted:
+        return Metric(name=name)
+
+    if len(extracted) == 4:
+        vals, label, raw, page = extracted
+    else:
+        vals, label, raw = extracted
+    vals = [x * factor for x in vals]
+
+    # Statement order is:
+    # current quarter, previous quarter, corresponding previous-year quarter,
+    # previous financial year.
+    cur, prev_q, yoy = vals[:3]
+
+    return Metric(
+        name=name,
+        current=cur,
+        previous_q=prev_q,
+        yoy=yoy,
+        qoq_pct=pct_change(cur, prev_q),
+        yoy_pct=pct_change(cur, yoy),
+        confidence="HIGH",
+        source=label,
+        raw=raw,
+    )
+
+
+def derive_ebitda(metrics):
+    # EBITDA = PBT + Finance Costs + Depreciation - Other Income.
+    # This is only a fallback when all required components exist.
+    required = ["pbt", "finance_cost", "depreciation", "other_income"]
+    if not all(metrics[k] and metrics[k].current is not None for k in required):
+        return Metric(name="ebitda")
+
+    def d(i):
+        vals = []
+        for k in required:
+            m = metrics[k]
+            vals.append([m.current, m.previous_q, m.yoy][i])
+        if any(v is None for v in vals):
+            return None
+        return vals[0] + vals[1] + vals[2] - vals[3]
+
+    vals = [d(0), d(1), d(2)]
+    if any(v is None for v in vals):
+        return Metric(name="ebitda")
+
+    return Metric(
+        name="ebitda",
+        current=vals[0],
+        previous_q=vals[1],
+        yoy=vals[2],
+        qoq_pct=pct_change(vals[0], vals[1]),
+        yoy_pct=pct_change(vals[0], vals[2]),
+        confidence="DERIVED",
+        source="PBT + Finance Costs + Depreciation - Other Income",
+        raw=[],
+    )
+
+
+def validate_metric(m: Metric, revenue: Metric, warnings):
+    if m.current is None:
+        warnings.append(f"{m.name.upper()} could not be confidently extracted.")
+        return
+
+    # Catch obvious OCR/column errors without rejecting legitimate volatility.
+    if revenue.current not in (None, 0) and m.name in {"ebitda", "pat"}:
+        ratio = abs(m.current / revenue.current)
+        if ratio > 1.5:
+            warnings.append(
+                f"{m.name.upper()} is >150% of current revenue; possible column/OCR error."
+            )
+
+    if m.qoq_pct is not None and abs(m.qoq_pct) > 5000:
+        warnings.append(
+            f"{m.name.upper()} shows an extreme QoQ change ({m.qoq_pct:.0f}%). Review extraction."
+        )
+    if m.yoy_pct is not None and abs(m.yoy_pct) > 5000:
+        warnings.append(
+            f"{m.name.upper()} shows an extreme YoY change ({m.yoy_pct:.0f}%). Review extraction."
+        )
+
+
+def analyse(data, basis, quarter, force_ocr):
+    doc = pymupdf.open(stream=data, filetype="pdf")
+    company = detect_company(doc)
+
+    selected_basis, pages = statement_pages(doc, basis, force_ocr)
+    # The statement page is the authoritative company-name source.
+    statement_head = page_text(doc[pages[0]], force_ocr).splitlines()
+    for line in statement_head[:12]:
+        candidate_name = re.sub(r"\s+", " ", line.strip())
+        if (
+            4 <= len(candidate_name) <= 120
+            and re.search(r"\b(LIMITED|LTD\.?|INDIA|INDUSTRIES|INVESTMENTS|PRODUCTS)\b",
+                          candidate_name, re.I)
+            and not re.search(r"REGISTERED|REGD|WEBSITE|EMAIL|CIN|PHONE|TELEPHONE",
+                              candidate_name, re.I)
+        ):
+            company = candidate_name.upper()
+            break
+
+    all_lines = []
+    page_texts = []
+    for pno in pages:
+        t = page_text(doc[pno], force_ocr)
+        page_texts.append(t)
+        all_lines.extend([x.strip() for x in t.splitlines() if x.strip()])
+
+    unit_factor, unit_name = detect_unit("\n".join(page_texts))
+
+    # Primary extraction uses visual rows. Text-line extraction is retained
+    # as a fallback for unusual PDFs.
+    visual_rows = page_rows(doc, pages, force_ocr)
+
+    metrics = {}
+    for k in ["revenue", "other_income", "finance_cost", "depreciation", "pbt"]:
+        ex = extract_metric_rows(visual_rows, k)
+        if ex is not None:
+            metrics[k] = make_metric(k, ex, unit_factor)
+        else:
+            metrics[k] = make_metric(k, extract_metric(all_lines, k), unit_factor)
+
+    # Prefer consolidated "profit attributable to owners" for CONSOLIDATED.
+    if selected_basis == "CONSOLIDATED":
+        owner0 = extract_pat_owner(visual_rows)
+        owner = owner0
+        if owner:
+            metrics["pat"] = make_metric("pat", owner, unit_factor)
+        else:
+            ex = extract_metric_rows(visual_rows, "pat_total")
+            metrics["pat"] = make_metric(
+                "pat", ex if ex else extract_metric(all_lines, "pat_total"), unit_factor
+            )
+    else:
+        ex = extract_metric_rows(visual_rows, "pat_total")
+        metrics["pat"] = make_metric(
+            "pat", ex if ex else extract_metric(all_lines, "pat_total"), unit_factor
+        )
+
+    explicit = extract_metric_rows(visual_rows, "ebitda")
+    if explicit is None:
+        explicit = extract_metric(all_lines, "ebitda")
+    if explicit:
+        metrics["ebitda"] = make_metric("ebitda", explicit, unit_factor)
+    else:
+        metrics["ebitda"] = derive_ebitda(metrics)
+
+    revenue = metrics["revenue"]
+    ebitda = metrics["ebitda"]
+    pat = metrics["pat"]
+
+    current_margin = (
+        ebitda.current / revenue.current * 100
+        if ebitda.current is not None and revenue.current not in (None, 0)
+        else None
+    )
+    prev_margin = (
+        ebitda.previous_q / revenue.previous_q * 100
+        if ebitda.previous_q is not None and revenue.previous_q not in (None, 0)
+        else None
+    )
+    yoy_margin = (
+        ebitda.yoy / revenue.yoy * 100
+        if ebitda.yoy is not None and revenue.yoy not in (None, 0)
+        else None
+    )
+
+    warnings = []
+    for m in [revenue, ebitda, pat]:
+        validate_metric(m, revenue, warnings)
+
+    # Do not let a single malformed metric crash the application.
+    if current_margin is not None and not -100 <= current_margin <= 100:
+        warnings.append("Current EBITDA margin is outside a normal range; review extraction.")
+
+    # Diagnostic table: show only the selected statement, never mixed pages.
+    diagnostics = []
+    for k, m in metrics.items():
+        diagnostics.append({
+            "Metric": k,
+            "Current": m.current,
+            "Previous Q": m.previous_q,
+            "YoY": m.yoy,
+            "QoQ %": m.qoq_pct,
+            "YoY %": m.yoy_pct,
+            "Confidence": m.confidence,
+            "Source": m.source,
+            "Raw": " | ".join(m.raw or []),
+        })
+
+    result = {
+        "company": company,
+        "quarter": quarter,
+        "basis": selected_basis,
+        "unit": unit_name,
+        "pages": [p + 1 for p in pages],
+        "revenue": asdict(revenue),
+        "ebitda": asdict(ebitda),
+        "pat": asdict(pat),
+        "margin_current": current_margin,
+        "margin_previous_q": prev_margin,
+        "margin_yoy": yoy_margin,
+        "margin_qoq_bps": (
+            (current_margin - prev_margin) * 100
+            if current_margin is not None and prev_margin is not None
+            else None
+        ),
+        "margin_yoy_bps": (
+            (current_margin - yoy_margin) * 100
+            if current_margin is not None and yoy_margin is not None
+            else None
+        ),
+        "warnings": warnings,
+        "diagnostics": diagnostics,
+        "statement_page_count": len(pages),
+    }
     doc.close()
-    return r
+    return result
 
-def ch(v):return "NA" if v is None else f"{'UP' if v>=0 else 'DOWN'} {abs(v):.0f}%"
-def pct(v):return "NA" if v is None else f"{v:.1f}%"
 
-def summary(r):
-    rev,eb,pat=r["revenue"],r["ebitda"],r["pat"]
-    revenue="REVENUE NA" if rev["current"] is None else f"REVENUE {ch(rev['yoypct'])} AT ₹{rev['current']:,.1f} CR (YOY), {ch(rev['qoq'])} (QOQ)"
-    ebitda="EBITDA NA" if eb["current"] is None else f"EBITDA {ch(eb['yoypct'])} AT ₹{eb['current']:,.1f} CR (YOY), {ch(eb['qoq'])} (QOQ)"
-    profit="CONS NET PROFIT NA" if pat["current"] is None else f"CONS NET PROFIT {ch(pat['yoypct'])} AT ₹{pat['current']:,.1f} CR (YOY), {ch(pat['qoq'])} (QOQ)"
-    return "\n\n".join([f"{r['company']} {r['quarter']} :",revenue,ebitda,
-        f"MARGINS {pct(r['margin_current'])} V {pct(r['margin_yoy'])} (YOY), {pct(r['margin_previous'])} (QOQ)",profit])
+def direction(v):
+    if v is None:
+        return "NA"
+    return "UP" if v >= 0 else "DOWN"
+
+
+def pct_text(v, decimals=0):
+    return "NA" if v is None else f"{abs(v):.{decimals}f}%"
+
+
+def result_line(name, m):
+    if m["current"] is None:
+        return f"{name} NA"
+    return (
+        f"{name} {direction(m['yoy_pct'])} {pct_text(m['yoy_pct'])} "
+        f"AT ₹{m['current']:,.1f} CR (YOY), "
+        f"{direction(m['qoq_pct'])} {pct_text(m['qoq_pct'])} (QOQ)"
+    )
+
+
+def render_summary(r):
+    company = re.sub(
+        r"\s+(LIMITED|LTD\.?|PRIVATE LIMITED|PVT\. LTD\.?)$",
+        "",
+        r["company"],
+        flags=re.I,
+    ).strip().upper()
+
+    margin = "NA" if r["margin_current"] is None else f"{r['margin_current']:.1f}%"
+    yoy_margin = "NA" if r["margin_yoy"] is None else f"{r['margin_yoy']:.1f}%"
+    qoq_margin = "NA" if r["margin_previous_q"] is None else f"{r['margin_previous_q']:.1f}%"
+
+    return "\n\n".join([
+        f"{company} {r['quarter']} :",
+        result_line("REVENUE", r["revenue"]),
+        result_line("EBITDA", r["ebitda"]),
+        f"MARGINS {margin} V {yoy_margin} (YOY), {qoq_margin} (QOQ)",
+        result_line("CONS NET PROFIT", r["pat"]),
+    ])
+
+
+# ============================================================
+# UI
+# ============================================================
+
+st.title("📊 Quarterly Financial Results Analyser")
+st.caption("Final build — statement-first extraction, strict basis locking, OCR-safe parsing")
 
 with st.sidebar:
-    q=st.selectbox("Quarter",["Q1","Q2","Q3","Q4"])
-    basis=st.radio("Results basis",["AUTO","CONSOLIDATED","STANDALONE"])
-    ocr=st.checkbox("Force OCR",False)
+    st.header("Analysis settings")
+    quarter = st.selectbox("Quarter", ["Q1", "Q2", "Q3", "Q4"], index=0)
+    basis = st.radio(
+        "Results basis",
+        ["AUTO", "CONSOLIDATED", "STANDALONE"],
+        index=0,
+        help="AUTO prefers consolidated when both statements are present.",
+    )
+    force_ocr = st.checkbox(
+        "Force OCR",
+        value=False,
+        help="Use only if the PDF has no usable text layer.",
+    )
 
-url=st.text_input("Direct PDF link")
-up=st.file_uploader("Or upload PDF",type=["pdf"])
+url = st.text_input(
+    "Direct PDF link",
+    placeholder="https://nsearchives.nseindia.com/corporate/....pdf",
+)
+upload = st.file_uploader("Or upload PDF", type=["pdf"])
 
-if st.button("ANALYSE",type="primary",width="stretch"):
+if st.button("ANALYSE", type="primary", width="stretch"):
     try:
-        data=up.getvalue() if up else pdfdata(url.strip()) if url.strip() else None
-        if not data:st.error("Paste a direct PDF link or upload a PDF.");st.stop()
-        r=analyse(data,basis,ocr,q)
-        st.success(f"Selected {r['basis']} table — pages {r['start_page']}–{r['end_page']}")
-        st.subheader("Results");st.code(summary(r))
+        if upload is not None:
+            data = upload.getvalue()
+        elif url.strip():
+            data = get_pdf(url.strip())
+        else:
+            st.error("Please paste a direct PDF link or upload a PDF.")
+            st.stop()
+
+        r = analyse(data, basis, quarter, force_ocr)
+
+        st.success(
+            f"Selected {r['basis']} statement • PDF pages {r['pages'][0]}–{r['pages'][-1]} "
+            f"• {r['unit']}"
+        )
+
+        st.subheader("Results")
+        st.code(render_summary(r))
+
         if r["warnings"]:
-            with st.expander("⚠ Review warnings",True):
-                for w in r["warnings"]:st.warning(w)
-        with st.expander("🔎 Extraction diagnostics",True):
-            st.write("Header:",r["header"] or "Not detected")
-            st.write("Anchor source:",r["anchor_source"])
-            st.write("Column X anchors:",r["column_anchors"])
-            for lab in ["revenue","finance_cost","depreciation","pbt","pat","ebitda"]:
-                m=r[lab]
-                st.markdown(f"**{lab.upper()} — {m['confidence']}**")
-                st.code(m["source"] or "Not found")
-                st.caption("Mapped: "+" | ".join(str(x) for x in m["mapped"]))
-        calc=[{"Metric":k.title(),"Current":r[k]["current"],"Previous Q":r[k]["previous"],"YoY":r[k]["yoy"],"QoQ %":r[k]["qoq"],"YoY %":r[k]["yoypct"],"Confidence":r[k]["confidence"]} for k in ["revenue","ebitda","pat"]]
-        st.dataframe(pd.DataFrame(calc),width="stretch",hide_index=True)
-        st.download_button("Download JSON",json.dumps(r,indent=2,default=str),file_name="results_analysis_v5_5.json",mime="application/json")
+            with st.expander("⚠ Review warnings", expanded=True):
+                for w in r["warnings"]:
+                    st.warning(w)
+        else:
+            st.success("No extraction validation warnings.")
+
+        with st.expander("🔎 Extraction diagnostics", expanded=False):
+            st.write("Basis:", r["basis"])
+            st.write("Selected PDF pages:", r["pages"])
+            st.write("Unit:", r["unit"])
+            st.dataframe(
+                pd.DataFrame(r["diagnostics"]),
+                width="stretch",
+                hide_index=True,
+            )
+
+        table = pd.DataFrame([
+            {
+                "Metric": x["Metric"],
+                "Current ₹cr": x["Current"],
+                "Previous Q ₹cr": x["Previous Q"],
+                "YoY ₹cr": x["YoY"],
+                "QoQ %": x["QoQ %"],
+                "YoY %": x["YoY %"],
+                "Confidence": x["Confidence"],
+            }
+            for x in r["diagnostics"]
+            if x["Metric"] in {"revenue", "ebitda", "pat"}
+        ])
+        st.subheader("Calculation details")
+        st.dataframe(table, width="stretch", hide_index=True)
+
+        st.download_button(
+            "Download JSON",
+            json.dumps(r, indent=2, default=str),
+            file_name="results_analysis_final.json",
+            mime="application/json",
+        )
+
     except Exception as e:
-        st.error(f"Analysis failed: {e}");st.exception(e)
+        # Never leave the user with a blank page or a cryptic NoneType error.
+        st.error(f"Analysis failed: {type(e).__name__}: {e}")
+        st.info(
+            "If this is a new PDF format, download the JSON diagnostics and share it "
+            "for a controlled parser update."
+        )
+        with st.expander("Technical error", expanded=False):
+            st.exception(e)
