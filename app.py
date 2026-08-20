@@ -310,13 +310,24 @@ def statement_pages(doc, desired_basis: str, force_ocr=False):
 
 
 def detect_unit(text: str):
+    """
+    Detect and PRESERVE the monetary unit declared by the selected statement.
+
+    The analyser must not silently convert source figures from millions/lakhs/
+    thousands into crores and then label them as crores. Values remain in the
+    source unit; the unit is carried through to the result and UI.
+    """
     low = text.lower()
-    if re.search(r"\(\s*['₹]?\s*in\s+lakhs?\s*\)", low) or re.search(r"in lakhs", low):
-        return 0.01, "₹ crore (converted from lakhs)"
-    if re.search(r"in\s+millions?", low):
-        return 0.10, "₹ crore (converted from millions)"
-    if re.search(r"in\s+thousands?", low):
-        return 0.0001, "₹ crore (converted from thousands)"
+
+    if re.search(r"\(\s*['₹]?\s*in\s+lakhs?\s*\)", low) or re.search(r"\bin\s+lakhs?\b", low):
+        return 1.0, "₹ lakh"
+    if re.search(r"\(\s*['₹]?\s*in\s+millions?\s*\)", low) or re.search(r"\bin\s+millions?\b", low):
+        return 1.0, "₹ million"
+    if re.search(r"\(\s*['₹]?\s*in\s+thousands?\s*\)", low) or re.search(r"\bin\s+thousands?\b", low):
+        return 1.0, "₹ thousand"
+    if re.search(r"\(\s*['₹]?\s*in\s+crores?\s*\)", low) or re.search(r"\bin\s+crores?\b", low):
+        return 1.0, "₹ crore"
+
     return 1.0, "₹ crore"
 
 
@@ -891,12 +902,12 @@ def pct_text(v, decimals=0):
     return "NA" if v is None else f"{abs(v):.{decimals}f}%"
 
 
-def result_line(name, m):
+def result_line(name, m, unit):
     if m["current"] is None:
         return f"{name} NA"
     return (
         f"{name} {direction(m['yoy_pct'])} {pct_text(m['yoy_pct'])} "
-        f"AT ₹{m['current']:,.1f} CR (YOY), "
+        f"AT {unit}{m['current']:,.2f} (YOY), "
         f"{direction(m['qoq_pct'])} {pct_text(m['qoq_pct'])} (QOQ)"
     )
 
@@ -913,12 +924,13 @@ def render_summary(r):
     yoy_margin = "NA" if r["margin_yoy"] is None else f"{r['margin_yoy']:.1f}%"
     qoq_margin = "NA" if r["margin_previous_q"] is None else f"{r['margin_previous_q']:.1f}%"
 
+    unit = r.get("unit", "₹ crore") + " "
     return "\n\n".join([
         f"{company} {r['quarter']} :",
-        result_line("REVENUE", r["revenue"]),
-        result_line("EBITDA", r["ebitda"]),
+        result_line("REVENUE", r["revenue"], unit),
+        result_line("EBITDA", r["ebitda"], unit),
         f"MARGINS {margin} V {yoy_margin} (YOY), {qoq_margin} (QOQ)",
-        result_line("CONS NET PROFIT", r["pat"]),
+        result_line("CONS NET PROFIT", r["pat"], unit),
     ])
 
 
@@ -990,9 +1002,9 @@ if st.button("ANALYSE", type="primary", width="stretch"):
         table = pd.DataFrame([
             {
                 "Metric": x["Metric"],
-                "Current ₹cr": x["Current"],
-                "Previous Q ₹cr": x["Previous Q"],
-                "YoY ₹cr": x["YoY"],
+                f"Current {r['unit']}": x["Current"],
+                f"Previous Q {r['unit']}": x["Previous Q"],
+                f"YoY {r['unit']}": x["YoY"],
                 "QoQ %": x["QoQ %"],
                 "YoY %": x["YoY %"],
                 "Confidence": x["Confidence"],
