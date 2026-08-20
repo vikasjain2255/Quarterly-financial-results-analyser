@@ -310,45 +310,55 @@ def statement_pages(doc, desired_basis: str, force_ocr=False):
 
 
 def detect_unit(text: str):
-    """Detect the monetary unit declared by the selected statement.
+    """
+    Detect the source monetary unit and return the factor needed to
+    normalize all monetary values to ₹ crore.
 
-    IMPORTANT: source figures are NEVER converted here. The detected unit is
-    preserved exactly for display. We deliberately avoid defaulting to crore
-    when an explicit unit is present in any common BSE/NSE wording.
+      ₹ crore    -> x1
+      ₹ million  -> x0.10
+      ₹ lakh     -> x0.01
+      ₹ thousand -> x0.0001
+
+    Final analyser output is always standardized to ₹ crore.
     """
     low = re.sub(r"\s+", " ", text.lower())
 
-    # Match common exchange-filing variants, including OCR spacing/punctuation.
-    million_patterns = [
-        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?millions?\b",
-        r"(?:amount|figures|numbers|financials?)\s*(?:are|is)?\s*(?:stated|reported|given)?\s*(?:in\s+)?millions?\b",
-        r"\bin\s+millions?\b",
-    ]
-    lakh_patterns = [
-        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?lakhs?\b",
-        r"\bin\s+lakhs?\b",
-    ]
-    thousand_patterns = [
-        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?thousands?\b",
-        r"\bin\s+thousands?\b",
-    ]
-    crore_patterns = [
-        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?crores?\b",
-        r"\bin\s+crores?\b",
-    ]
+    # Million: common BSE/NSE variants.
+    if re.search(
+        r"(?:₹|rs\.?|inr)?\s*\(?\s*in\s+millions?\s*\)?|"
+        r"(?:₹|rs\.?|inr)\s+millions?\b|"
+        r"\bmillions?\s+of\s+rupees\b",
+        low,
+    ):
+        return 0.10, "₹ crore (source: ₹ million)"
 
-    if any(re.search(p, low) for p in million_patterns):
-        return 1.0, "₹ million"
-    if any(re.search(p, low) for p in lakh_patterns):
-        return 1.0, "₹ lakh"
-    if any(re.search(p, low) for p in thousand_patterns):
-        return 1.0, "₹ thousand"
-    if any(re.search(p, low) for p in crore_patterns):
-        return 1.0, "₹ crore"
+    # Lakh / lakhs.
+    if re.search(
+        r"(?:₹|rs\.?|inr)?\s*\(?\s*in\s+lakhs?\s*\)?|"
+        r"(?:₹|rs\.?|inr)\s+lakhs?\b",
+        low,
+    ):
+        return 0.01, "₹ crore (source: ₹ lakh)"
 
-    # Do NOT silently label an undetected source as crore. This makes a unit
-    # detection failure visible instead of producing a misleading result.
-    return 1.0, "SOURCE UNIT NOT DETECTED"
+    # Thousand.
+    if re.search(
+        r"(?:₹|rs\.?|inr)?\s*\(?\s*in\s+thousands?\s*\)?|"
+        r"(?:₹|rs\.?|inr)\s+thousands?\b",
+        low,
+    ):
+        return 0.0001, "₹ crore (source: ₹ thousand)"
+
+    # Crore / crores.
+    if re.search(
+        r"(?:₹|rs\.?|inr)?\s*\(?\s*in\s+crores?\s*\)?|"
+        r"(?:₹|rs\.?|inr)\s+crores?\b",
+        low,
+    ):
+        return 1.0, "₹ crore (source: ₹ crore)"
+
+    # Preserve existing behavior when the statement does not explicitly
+    # declare a unit.
+    return 1.0, "₹ crore (unit not explicitly stated)"
 
 
 def find_header(lines):
@@ -801,10 +811,6 @@ def analyse(data, basis, quarter, force_ocr):
         all_lines.extend([x.strip() for x in t.splitlines() if x.strip()])
 
     unit_factor, unit_name = detect_unit("\n".join(page_texts))
-    if unit_name == "SOURCE UNIT NOT DETECTED":
-        # Never silently assume crore when the filing unit could not be read.
-        # The user can inspect the selected statement pages and diagnostics.
-        pass
 
     # Primary extraction uses visual rows. Text-line extraction is retained
     # as a fallback for unusual PDFs.
@@ -926,12 +932,12 @@ def pct_text(v, decimals=0):
     return "NA" if v is None else f"{abs(v):.{decimals}f}%"
 
 
-def result_line(name, m, unit):
+def result_line(name, m):
     if m["current"] is None:
         return f"{name} NA"
     return (
         f"{name} {direction(m['yoy_pct'])} {pct_text(m['yoy_pct'])} "
-        f"AT {unit}{m['current']:,.2f} (YOY), "
+        f"AT ₹{m['current']:,.1f} CR (YOY), "
         f"{direction(m['qoq_pct'])} {pct_text(m['qoq_pct'])} (QOQ)"
     )
 
@@ -948,13 +954,12 @@ def render_summary(r):
     yoy_margin = "NA" if r["margin_yoy"] is None else f"{r['margin_yoy']:.1f}%"
     qoq_margin = "NA" if r["margin_previous_q"] is None else f"{r['margin_previous_q']:.1f}%"
 
-    unit = r.get("unit", "₹ crore") + " "
     return "\n\n".join([
         f"{company} {r['quarter']} :",
-        result_line("REVENUE", r["revenue"], unit),
-        result_line("EBITDA", r["ebitda"], unit),
+        result_line("REVENUE", r["revenue"]),
+        result_line("EBITDA", r["ebitda"]),
         f"MARGINS {margin} V {yoy_margin} (YOY), {qoq_margin} (QOQ)",
-        result_line("CONS NET PROFIT", r["pat"], unit),
+        result_line("CONS NET PROFIT", r["pat"]),
     ])
 
 
@@ -1002,6 +1007,7 @@ if st.button("ANALYSE", type="primary", width="stretch"):
             f"Selected {r['basis']} statement • PDF pages {r['pages'][0]}–{r['pages'][-1]} "
             f"• {r['unit']}"
         )
+        st.caption("All monetary values are normalized and displayed in ₹ crore.")
 
         st.subheader("Results")
         st.code(render_summary(r))
@@ -1026,9 +1032,9 @@ if st.button("ANALYSE", type="primary", width="stretch"):
         table = pd.DataFrame([
             {
                 "Metric": x["Metric"],
-                f"Current {r['unit']}": x["Current"],
-                f"Previous Q {r['unit']}": x["Previous Q"],
-                f"YoY {r['unit']}": x["YoY"],
+                "Current ₹cr": x["Current"],
+                "Previous Q ₹cr": x["Previous Q"],
+                "YoY ₹cr": x["YoY"],
                 "QoQ %": x["QoQ %"],
                 "YoY %": x["YoY %"],
                 "Confidence": x["Confidence"],
