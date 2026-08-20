@@ -310,25 +310,45 @@ def statement_pages(doc, desired_basis: str, force_ocr=False):
 
 
 def detect_unit(text: str):
-    """
-    Detect and PRESERVE the monetary unit declared by the selected statement.
+    """Detect the monetary unit declared by the selected statement.
 
-    The analyser must not silently convert source figures from millions/lakhs/
-    thousands into crores and then label them as crores. Values remain in the
-    source unit; the unit is carried through to the result and UI.
+    IMPORTANT: source figures are NEVER converted here. The detected unit is
+    preserved exactly for display. We deliberately avoid defaulting to crore
+    when an explicit unit is present in any common BSE/NSE wording.
     """
-    low = text.lower()
+    low = re.sub(r"\s+", " ", text.lower())
 
-    if re.search(r"\(\s*['₹]?\s*in\s+lakhs?\s*\)", low) or re.search(r"\bin\s+lakhs?\b", low):
-        return 1.0, "₹ lakh"
-    if re.search(r"\(\s*['₹]?\s*in\s+millions?\s*\)", low) or re.search(r"\bin\s+millions?\b", low):
+    # Match common exchange-filing variants, including OCR spacing/punctuation.
+    million_patterns = [
+        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?millions?\b",
+        r"(?:amount|figures|numbers|financials?)\s*(?:are|is)?\s*(?:stated|reported|given)?\s*(?:in\s+)?millions?\b",
+        r"\bin\s+millions?\b",
+    ]
+    lakh_patterns = [
+        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?lakhs?\b",
+        r"\bin\s+lakhs?\b",
+    ]
+    thousand_patterns = [
+        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?thousands?\b",
+        r"\bin\s+thousands?\b",
+    ]
+    crore_patterns = [
+        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?crores?\b",
+        r"\bin\s+crores?\b",
+    ]
+
+    if any(re.search(p, low) for p in million_patterns):
         return 1.0, "₹ million"
-    if re.search(r"\(\s*['₹]?\s*in\s+thousands?\s*\)", low) or re.search(r"\bin\s+thousands?\b", low):
+    if any(re.search(p, low) for p in lakh_patterns):
+        return 1.0, "₹ lakh"
+    if any(re.search(p, low) for p in thousand_patterns):
         return 1.0, "₹ thousand"
-    if re.search(r"\(\s*['₹]?\s*in\s+crores?\s*\)", low) or re.search(r"\bin\s+crores?\b", low):
+    if any(re.search(p, low) for p in crore_patterns):
         return 1.0, "₹ crore"
 
-    return 1.0, "₹ crore"
+    # Do NOT silently label an undetected source as crore. This makes a unit
+    # detection failure visible instead of producing a misleading result.
+    return 1.0, "SOURCE UNIT NOT DETECTED"
 
 
 def find_header(lines):
@@ -781,6 +801,10 @@ def analyse(data, basis, quarter, force_ocr):
         all_lines.extend([x.strip() for x in t.splitlines() if x.strip()])
 
     unit_factor, unit_name = detect_unit("\n".join(page_texts))
+    if unit_name == "SOURCE UNIT NOT DETECTED":
+        # Never silently assume crore when the filing unit could not be read.
+        # The user can inspect the selected statement pages and diagnostics.
+        pass
 
     # Primary extraction uses visual rows. Text-line extraction is retained
     # as a fallback for unusual PDFs.
