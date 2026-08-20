@@ -1,3 +1,4 @@
+
 import io, json, re, urllib.request
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict, Tuple
@@ -64,7 +65,7 @@ METRIC_PATTERNS = {
         r"profit\s+attributable\s+to\s+owners",
     ],
     "ebitda": [
-        r"ebitda",
+        r"\bebitda\b",
         r"earnings\s+before\s+interest.*depreciation.*amort",
     ],
 }
@@ -106,16 +107,16 @@ def numeric_candidates(token: str):
     raw = raw.strip("()[]{}")
 
     if re.fullmatch(r"\d+(?:\.\d+)?", raw):
-        v = float(raw)
+        v=float(raw)
         return [-v if neg else v]
 
     # OCR possibilities. The values are intentionally small and scoped to
     # financial-number tokens; normal prose is rejected later by row context.
     choices = {
-        "O": "0", "o": "0", "I": "1", "l": "1", "|": "1", "t": "1", "T": "1", "L": "1",
-        "S": "5", "s": "5", "B": "8", "b": "8", "G": "6", "g": "9", "Z": "2", "z": "2",
-        "Q": "0", "q": "9", "R": "8", "r": "1", "A": "8", "a": "4", "E": "3", "e": "3",
-        "M": "44", "m": "44", "!": "1", "?": "2", "'": "7",
+        "O":"0","o":"0","I":"1","l":"1","|":"1","t":"1","T":"1","L":"1",
+        "S":"5","s":"5","B":"8","b":"8","G":"6","g":"9","Z":"2","z":"2",
+        "Q":"0","q":"9","R":"8","r":"1","A":"8","a":"4","E":"3","e":"3",
+        "M":"44","m":"44","!":"1","?":"2","'":"7",
     }
 
     # A small beam rather than an uncontrolled combinatorial expansion.
@@ -124,32 +125,32 @@ def numeric_candidates(token: str):
         variants |= {v.replace(ch, rep) for v in list(variants) if ch in v}
 
     # Common OCR hyphen inside a number is usually a decimal point.
-    expanded = set(variants)
+    expanded=set(variants)
     for v in list(variants):
         if "-" in v[1:]:
             expanded.add(v.replace("-", ".", 1))
-    variants = expanded
+    variants=expanded
 
-    results = []
+    results=[]
     for v in variants:
         # Remove OCR punctuation that is not useful.
-        v = re.sub(r"[^0-9.\-]", "", v)
+        v=re.sub(r"[^0-9.\-]", "", v)
         if not v:
             continue
-        if v.count(".") > 1:
-            first = v.find(".")
-            v = v[:first + 1] + v[first + 1:].replace(".", "")
-        if v.startswith("-") and v.count("-") > 1:
+        if v.count(".")>1:
+            first=v.find(".")
+            v=v[:first+1]+v[first+1:].replace(".","")
+        if v.startswith("-") and v.count("-")>1:
             continue
 
         # If no decimal was printed, financial statements generally use
         # two decimal places. Do not do this for very short integer tokens.
-        if "." not in v and re.fullmatch(r"\d{3,}", v):
-            v = v[:-2] + "." + v[-2:]
+        if "." not in v and re.fullmatch(r"\d{3,}",v):
+            v=v[:-2]+"."+v[-2:]
 
-        if re.fullmatch(r"\d+(?:\.\d+)?", v):
-            x = float(v)
-            if x <= 1e10:
+        if re.fullmatch(r"\d+(?:\.\d+)?",v):
+            x=float(v)
+            if x<=1e10:
                 results.append(-x if neg else x)
 
     # Unique, deterministic order.
@@ -157,8 +158,8 @@ def numeric_candidates(token: str):
 
 
 def clean_numeric_token(token: str):
-    vals = numeric_candidates(token)
-    return vals[0] if len(vals) == 1 else (vals[0] if vals else None)
+    vals=numeric_candidates(token)
+    return vals[0] if len(vals)==1 else (vals[0] if vals else None)
 
 
 def numeric_tokens(line: str) -> List[str]:
@@ -206,7 +207,7 @@ def detect_company(doc):
             if (
                 len(s) <= 120
                 and len(s) >= 4
-                and re.search(r"(LIMITED|LTD\.?|INDIA|INDUSTRIES|INVESTMENTS|PRODUCTS)", s, re.I)
+                and re.search(r"\b(LIMITED|LTD\.?|INDIA|INDUSTRIES|INVESTMENTS|PRODUCTS)\b", s, re.I)
                 and not re.search(r"REGISTERED|REGD|WEBSITE|EMAIL|CIN|PHONE|TELEPHONE", s, re.I)
             ):
                 return re.sub(r"\s+", " ", s).upper()
@@ -235,9 +236,9 @@ def statement_pages(doc, desired_basis: str, force_ocr=False):
         ))
 
         # Some PDFs have "Consolidated" and "Standalone" on separate lines.
-        if not cons and re.search(r"consolidated", low) and re.search(r"financial results", low):
+        if not cons and re.search(r"\bconsolidated\b", low) and re.search(r"\bfinancial results\b", low):
             cons = True
-        if not stand and re.search(r"standalone", low) and re.search(r"financial results", low):
+        if not stand and re.search(r"\bstandalone\b", low) and re.search(r"\bfinancial results\b", low):
             stand = True
 
         # A real results table must contain the financial-results heading AND
@@ -309,44 +310,45 @@ def statement_pages(doc, desired_basis: str, force_ocr=False):
 
 
 def detect_unit(text: str):
-    """Detect the monetary unit declared by the selected statement and return 
-    a conversion multiplier to standardise all figures into ₹ crore.
+    """Detect the monetary unit declared by the selected statement.
+
+    IMPORTANT: source figures are NEVER converted here. The detected unit is
+    preserved exactly for display. We deliberately avoid defaulting to crore
+    when an explicit unit is present in any common BSE/NSE wording.
     """
     low = re.sub(r"\s+", " ", text.lower())
 
+    # Match common exchange-filing variants, including OCR spacing/punctuation.
     million_patterns = [
-        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?millions?",
-        r"(?:amount|figures|numbers|financials?)\s*(?:are|is)?\s*(?:stated|reported|given)?\s*(?:in\s+)?millions?",
-        r"in\s+millions?",
+        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?millions?\b",
+        r"(?:amount|figures|numbers|financials?)\s*(?:are|is)?\s*(?:stated|reported|given)?\s*(?:in\s+)?millions?\b",
+        r"\bin\s+millions?\b",
     ]
     lakh_patterns = [
-        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?lakhs?",
-        r"in\s+lakhs?",
+        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?lakhs?\b",
+        r"\bin\s+lakhs?\b",
     ]
     thousand_patterns = [
-        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?thousands?",
-        r"in\s+thousands?",
+        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?thousands?\b",
+        r"\bin\s+thousands?\b",
     ]
     crore_patterns = [
-        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?crores?",
-        r"in\s+crores?",
+        r"(?:₹|rs\.?|inr)?\s*(?:in\s+)?crores?\b",
+        r"\bin\s+crores?\b",
     ]
 
-    # Convert source units to Crores:
-    # 1 Million = 0.1 Crore
-    # 1 Lakh = 0.01 Crore
-    # 1 Thousand = 0.0001 Crore
     if any(re.search(p, low) for p in million_patterns):
-        return 0.1, "₹ crore"
+        return 1.0, "₹ million"
     if any(re.search(p, low) for p in lakh_patterns):
-        return 0.01, "₹ crore"
+        return 1.0, "₹ lakh"
     if any(re.search(p, low) for p in thousand_patterns):
-        return 0.0001, "₹ crore"
+        return 1.0, "₹ thousand"
     if any(re.search(p, low) for p in crore_patterns):
         return 1.0, "₹ crore"
 
-    # Default factor to 1.0 if not detected, but label output as INR crore
-    return 1.0, "₹ crore"
+    # Do NOT silently label an undetected source as crore. This makes a unit
+    # detection failure visible instead of producing a misleading result.
+    return 1.0, "SOURCE UNIT NOT DETECTED"
 
 
 def find_header(lines):
@@ -430,6 +432,7 @@ def collect_row(lines, idx, max_forward=8):
     return (collected[:4] if len(collected) >= 4 else collected), label
 
 
+
 def merge_numeric_items(items):
     """
     Merge adjacent OCR fragments such as:
@@ -437,25 +440,25 @@ def merge_numeric_items(items):
       1?R + 15 -> 1?R15
     Only merge fragments that are very close horizontally.
     """
-    out = []
-    i = 0
-    while i < len(items):
-        cur = items[i]
-        if i + 1 < len(items):
-            nxt = items[i + 1]
-            gap = nxt["x"] - cur["x1"]
-            if gap <= 3.5 and (
+    out=[]
+    i=0
+    while i<len(items):
+        cur=items[i]
+        if i+1<len(items):
+            nxt=items[i+1]
+            gap=nxt["x"]-cur["x1"]
+            if gap<=3.5 and (
                 NUM_TOKEN.fullmatch(cur["text"].strip(",:;"))
-                or re.search(r"\d", cur["text"])
+                or re.search(r"\d",cur["text"])
             ) and (
                 NUM_TOKEN.fullmatch(nxt["text"].strip(",:;"))
-                or re.search(r"\d", nxt["text"])
+                or re.search(r"\d",nxt["text"])
             ):
-                cur = {"x": cur["x"], "x1": nxt["x1"],
-                       "text": cur["text"] + nxt["text"]}
-                i += 1
+                cur={"x":cur["x"],"x1":nxt["x1"],
+                     "text":cur["text"]+nxt["text"]}
+                i+=1
         out.append(cur)
-        i += 1
+        i+=1
     return out
 
 
@@ -465,47 +468,47 @@ def choose_row_values(tokens):
     The first three are current quarter / previous quarter / YoY quarter;
     the fourth is FY and may be several times larger.
     """
-    candidate_lists = [numeric_candidates(t) for t in tokens]
-    if len(candidate_lists) < 4:
+    candidate_lists=[numeric_candidates(t) for t in tokens]
+    if len(candidate_lists)<4:
         return None
 
     # Keep the first four visual financial columns.
-    candidate_lists = candidate_lists[:4]
-    best = None
+    candidate_lists=candidate_lists[:4]
+    best=None
 
     import itertools
     for combo in itertools.product(*candidate_lists):
-        if len(combo) != 4:
+        if len(combo)!=4:
             continue
-        a, b, c, d = combo
-        if any(abs(x) > 1e10 for x in combo):
+        a,b,c,d=combo
+        if any(abs(x)>1e10 for x in combo):
             continue
         # The first three periods should normally be in the same order of
         # magnitude. Allow extreme business moves, but strongly penalise
         # impossible 10x/0.1x OCR interpretations.
-        score = 0.0
-        for x, y in [(a, b), (a, c), (b, c)]:
-            if x == 0 or y == 0:
+        score=0.0
+        for x,y in [(a,b),(a,c),(b,c)]:
+            if x==0 or y==0:
                 continue
-            ratio = max(abs(x / y), abs(y / x))
-            if ratio > 12:
-                score -= 50
+            ratio=max(abs(x/y),abs(y/x))
+            if ratio>12:
+                score-=50
             else:
-                score -= abs(__import__("math").log10(ratio)) * 5
+                score-=abs(__import__("math").log10(ratio))*5
 
         # FY is cumulative and can legitimately be larger than Q1.
-        if a != 0 and d != 0:
-            ratio = abs(d / a)
-            if ratio < 0.25 or ratio > 20:
-                score -= 30
+        if a!=0 and d!=0:
+            ratio=abs(d/a)
+            if ratio<0.25 or ratio>20:
+                score-=30
 
         # Prefer values with two decimals.
         for x in combo:
-            if abs(x - round(x, 2)) < 1e-9:
-                score += 1
+            if abs(x-round(x,2))<1e-9:
+                score+=1
 
-        if best is None or score > best[0]:
-            best = (score, list(combo))
+        if best is None or score>best[0]:
+            best=(score,list(combo))
     return best[1] if best else None
 
 
@@ -551,12 +554,12 @@ def page_rows(doc, pages, force_ocr=False):
 
             # Financial columns start well to the right of the particulars
             # column in NSE result tables.
-            financial_items = [x for x in g["items"] if x["x"] > 300]
-            token_text = [x["text"] for x in financial_items]
-            chosen = choose_row_values(token_text) if len(token_text) >= 4 else None
+            financial_items=[x for x in g["items"] if x["x"]>300]
+            token_text=[x["text"] for x in financial_items]
+            chosen=choose_row_values(token_text) if len(token_text)>=4 else None
 
             if chosen is not None:
-                for x, v in zip(financial_items[:4], chosen):
+                for x,v in zip(financial_items[:4],chosen):
                     if not (1900 <= v <= 2100):
                         g["numbers"].append({
                             "value": v,
@@ -565,9 +568,9 @@ def page_rows(doc, pages, force_ocr=False):
                         })
             else:
                 for x in financial_items:
-                    vals = numeric_candidates(x["text"])
+                    vals=numeric_candidates(x["text"])
                     if vals:
-                        v = vals[0]
+                        v=vals[0]
                         if not (1900 <= v <= 2100):
                             g["numbers"].append({
                                 "value": v,
@@ -582,24 +585,23 @@ def page_rows(doc, pages, force_ocr=False):
 
 def extract_pat_owner(rows):
     """Pick the Owners row immediately associated with 'Profit attributable to'."""
-    anchor_indices = []
-    for i, r in enumerate(rows):
+    anchor_indices=[]
+    for i,r in enumerate(rows):
         if re.search(r"profit\s+attributable\s+to", r["text"], re.I):
             anchor_indices.append(i)
-    candidates = []
+    candidates=[]
     for ai in anchor_indices:
-        for j in range(ai + 1, min(ai + 6, len(rows))):
-            r = rows[j]
+        for j in range(ai+1, min(ai+6, len(rows))):
+            r=rows[j]
             if re.search(r"owners\s+of\s*the\s+compan", r["text"], re.I):
-                nums = [n for n in r["numbers"] if n["x"] > 300]
-                if len(nums) >= 4:
-                    candidates.append((j - ai, [n["value"] for n in nums[:4]], r["text"], [n["token"] for n in nums[:4]]))
+                nums=[n for n in r["numbers"] if n["x"]>300]
+                if len(nums)>=4:
+                    candidates.append((j-ai, [n["value"] for n in nums[:4]], r["text"], [n["token"] for n in nums[:4]]))
                 break
     if not candidates:
         return None
-    _, vals, label, raw = min(candidates, key=lambda x: x[0])
-    return vals, label, raw
-
+    _,vals,label,raw=min(candidates,key=lambda x:x[0])
+    return vals,label,raw
 
 def extract_metric_rows(rows, metric):
     """
@@ -783,7 +785,7 @@ def analyse(data, basis, quarter, force_ocr):
         candidate_name = re.sub(r"\s+", " ", line.strip())
         if (
             4 <= len(candidate_name) <= 120
-            and re.search(r"(LIMITED|LTD\.?|INDIA|INDUSTRIES|INVESTMENTS|PRODUCTS)",
+            and re.search(r"\b(LIMITED|LTD\.?|INDIA|INDUSTRIES|INVESTMENTS|PRODUCTS)\b",
                           candidate_name, re.I)
             and not re.search(r"REGISTERED|REGD|WEBSITE|EMAIL|CIN|PHONE|TELEPHONE",
                               candidate_name, re.I)
@@ -798,8 +800,11 @@ def analyse(data, basis, quarter, force_ocr):
         page_texts.append(t)
         all_lines.extend([x.strip() for x in t.splitlines() if x.strip()])
 
-    unit_factor, unit_name = detect_unit("
-".join(page_texts))
+    unit_factor, unit_name = detect_unit("\n".join(page_texts))
+    if unit_name == "SOURCE UNIT NOT DETECTED":
+        # Never silently assume crore when the filing unit could not be read.
+        # The user can inspect the selected statement pages and diagnostics.
+        pass
 
     # Primary extraction uses visual rows. Text-line extraction is retained
     # as a fallback for unusual PDFs.
@@ -943,10 +948,8 @@ def render_summary(r):
     yoy_margin = "NA" if r["margin_yoy"] is None else f"{r['margin_yoy']:.1f}%"
     qoq_margin = "NA" if r["margin_previous_q"] is None else f"{r['margin_previous_q']:.1f}%"
 
-    unit = "₹ crore "
-    return "
-
-".join([
+    unit = r.get("unit", "₹ crore") + " "
+    return "\n\n".join([
         f"{company} {r['quarter']} :",
         result_line("REVENUE", r["revenue"], unit),
         result_line("EBITDA", r["ebitda"], unit),
@@ -997,7 +1000,7 @@ if st.button("ANALYSE", type="primary", width="stretch"):
 
         st.success(
             f"Selected {r['basis']} statement • PDF pages {r['pages'][0]}–{r['pages'][-1]} "
-            f"• Output converted to {r['unit']}"
+            f"• {r['unit']}"
         )
 
         st.subheader("Results")
