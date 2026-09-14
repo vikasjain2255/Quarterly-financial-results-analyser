@@ -405,6 +405,65 @@ def validate_metric(m: Metric, revenue: Metric, warnings):
         )
 
 
+def detect_unit(text: str):
+    """
+    Detect the monetary unit declared by the selected financial-results
+    statement and return (factor, display_label), where factor converts
+    source values to INR crore.
+
+    Final displayed monetary values are ALWAYS normalized to INR crore.
+    """
+    low = re.sub(r"\s+", " ", text.lower())
+
+    # Normalize common punctuation/spelling variants first.
+    low = low.replace("₹", " rs ").replace("rs.", " rs ").replace("inr", " rs ")
+
+    # Million: 1 million = 0.10 crore
+    if re.search(
+        r"(?:\bfigures?\s+in\b|\bin\b|\bamounts?\s+in\b|\brs\b)"
+        r"\s*(?:the\s+)?(?:rs\s*)?(?:₹\s*)?"
+        r"(?:millions?|mn)\b"
+        r"|\b(?:rs|₹)\s*(?:in\s*)?(?:millions?|mn)\b"
+        r"|\bmillions?\s+of\s+rupees\b",
+        low,
+    ):
+        return 0.10, "₹ crore (source: ₹ million)"
+
+    # Lakh: 1 lakh = 0.01 crore
+    if re.search(
+        r"(?:\bfigures?\s+in\b|\bin\b|\bamounts?\s+in\b|\brs\b)"
+        r"\s*(?:the\s+)?(?:rs\s*)?(?:₹\s*)?"
+        r"(?:lakhs?|lacs?)\b"
+        r"|\b(?:rs|₹)\s*(?:in\s*)?(?:lakhs?|lacs?)\b",
+        low,
+    ):
+        return 0.01, "₹ crore (source: ₹ lakh)"
+
+    # Thousand: 1 thousand = 0.0001 crore
+    if re.search(
+        r"(?:\bfigures?\s+in\b|\bin\b|\bamounts?\s+in\b|\brs\b)"
+        r"\s*(?:the\s+)?(?:rs\s*)?(?:₹\s*)?"
+        r"(?:thousands?|000s?)\b"
+        r"|\b(?:rs|₹)\s*(?:in\s*)?(?:thousands?|000s?)\b",
+        low,
+    ):
+        return 0.0001, "₹ crore (source: ₹ thousand)"
+
+    # Crore: already in desired unit
+    if re.search(
+        r"(?:\bfigures?\s+in\b|\bin\b|\bamounts?\s+in\b|\brs\b)"
+        r"\s*(?:the\s+)?(?:rs\s*)?(?:₹\s*)?"
+        r"(?:crores?|crs?|cr)\b"
+        r"|\b(?:rs|₹)\s*(?:in\s*)?(?:crores?|crs?|cr)\b",
+        low,
+    ):
+        return 1.0, "₹ crore (source: ₹ crore)"
+
+    # If the statement does not explicitly declare a unit, do not alter
+    # values; this is the safest behavior for statements that already use
+    # crore-denominated figures.
+    return 1.0, "₹ crore (unit not explicitly stated)"
+
 def analyse(data, basis, quarter, force_ocr):
     doc = pymupdf.open(stream=data, filetype="pdf")
     company = detect_company(doc)
