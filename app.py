@@ -29,6 +29,34 @@ st.set_page_config(
 NUM_TOKEN = re.compile(r"^[\(\[\{]?[0-9OoIlLSsBbGgZzQq,\.\-]+[\)\]\}]?$")
 YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 
+# Numbered statement rows (e.g. "3   Profit before tax ... (1-2)") print a
+# row/item number and a derivation reference right next to the actual data
+# columns. Both look numeric to a naive token scan but are never financial
+# figures, and must be rejected before any value extraction happens.
+FORMULA_REF = re.compile(r"^\(?\s*\d{1,2}\s*-\s*\d{1,2}\s*\)?$")
+ROW_NUM = re.compile(r"^\(?\d{1,2}\)?$")
+
+
+def is_plausible_value_token(text: str) -> bool:
+    """
+    True only for a token that could plausibly be a printed financial
+    figure. Rejects row/item numbers ('3', '5'), derivation references
+    ('(1-2)', '(3-4)'), and any word that isn't number-shaped at all.
+    Real figures in these statements are always multi-digit with a decimal
+    point (and usually a thousands separator), so short bare integers or
+    dash-joined pairs are never legitimate data columns.
+    """
+    t = text.strip().strip(",;:")
+    if not t:
+        return False
+    if not NUM_TOKEN.fullmatch(t):
+        return False
+    if FORMULA_REF.fullmatch(t):
+        return False
+    if ROW_NUM.fullmatch(t):
+        return False
+    return True
+
 METRIC_PATTERNS = {
     "revenue": [
         r"revenue\s+from\s+operations",
@@ -170,7 +198,9 @@ def numeric_tokens(line: str) -> List[str]:
     out = []
     for tok in re.findall(r"\S+", line):
         tok2 = tok.strip(",;:")
-        if NUM_TOKEN.fullmatch(tok2) and clean_numeric_token(tok2) is not None:
+        if not is_plausible_value_token(tok2):
+            continue
+        if clean_numeric_token(tok2) is not None:
             out.append(tok2)
     return out
 
@@ -323,35 +353,41 @@ def detect_unit(text: str):
     """
     low = re.sub(r"\s+", " ", text.lower())
 
+    # A currency marker that may or may not appear right before the unit
+    # word (statements phrase this many different ways: "₹ in Lakhs",
+    # "Rs. Lakhs", "(Rupees in Lakhs)", "INR Lacs", "Amount in Lakhs", etc).
+    currency = r"(?:₹|rs\.?|inr|rupees)"
+
     # Million: common BSE/NSE variants.
     if re.search(
-        r"(?:₹|rs\.?|inr)?\s*\(?\s*in\s+millions?\s*\)?|"
-        r"(?:₹|rs\.?|inr)\s+millions?\b|"
+        rf"{currency}?\s*\(?\s*(?:amount\s+)?in\s+millions?\s*\)?|"
+        rf"{currency}\s+millions?\b|"
         r"\bmillions?\s+of\s+rupees\b",
         low,
     ):
         return 0.10, "₹ crore (source: ₹ million)"
 
-    # Lakh / lakhs.
+    # Lakh / lakhs / lac / lacs — all common spellings.
+    lakh_word = r"(?:lakhs?|lacs?)"
     if re.search(
-        r"(?:₹|rs\.?|inr)?\s*\(?\s*in\s+lakhs?\s*\)?|"
-        r"(?:₹|rs\.?|inr)\s+lakhs?\b",
+        rf"{currency}?\s*\(?\s*(?:amount\s+)?in\s+{lakh_word}\s*\)?|"
+        rf"{currency}\s+{lakh_word}\b",
         low,
     ):
         return 0.01, "₹ crore (source: ₹ lakh)"
 
     # Thousand.
     if re.search(
-        r"(?:₹|rs\.?|inr)?\s*\(?\s*in\s+thousands?\s*\)?|"
-        r"(?:₹|rs\.?|inr)\s+thousands?\b",
+        rf"{currency}?\s*\(?\s*(?:amount\s+)?in\s+thousands?\s*\)?|"
+        rf"{currency}\s+thousands?\b",
         low,
     ):
         return 0.0001, "₹ crore (source: ₹ thousand)"
 
     # Crore / crores.
     if re.search(
-        r"(?:₹|rs\.?|inr)?\s*\(?\s*in\s+crores?\s*\)?|"
-        r"(?:₹|rs\.?|inr)\s+crores?\b",
+        rf"{currency}?\s*\(?\s*(?:amount\s+)?in\s+crores?\s*\)?|"
+        rf"{currency}\s+crores?\b",
         low,
     ):
         return 1.0, "₹ crore (source: ₹ crore)"
@@ -563,8 +599,14 @@ def page_rows(doc, pages, force_ocr=False):
             g["numbers"] = []
 
             # Financial columns start well to the right of the particulars
-            # column in NSE result tables.
-            financial_items=[x for x in g["items"] if x["x"]>300]
+            # column in NSE result tables. Numbered statement rows (e.g.
+            # "3  Profit before tax ... (1-2)") print a row/item number and
+            # a derivation reference in that same right-hand zone; both must
+            # be excluded or they silently displace the real data columns.
+            financial_items=[
+                x for x in g["items"]
+                if x["x"]>300 and is_plausible_value_token(x["text"])
+            ]
             token_text=[x["text"] for x in financial_items]
             chosen=choose_row_values(token_text) if len(token_text)>=4 else None
 
@@ -773,6 +815,24 @@ def validate_metric(m: Metric, revenue: Metric, warnings):
             warnings.append(
                 f"{m.name.upper()} is >150% of current revenue; possible column/OCR error."
             )
+
+    # A row/item number ("3", "5") or a derivation reference ("(1-2)",
+    # "(3-4)") displacing the real column produces exactly this signature:
+    # the current-period value collapses to a near-zero figure while the
+    # metric's own previous-quarter/YoY values stay at the normal scale.
+    if (
+        m.current is not None
+        and m.previous_q not in (None, 0)
+        and m.yoy not in (None, 0)
+    ):
+        typical_scale = (abs(m.previous_q) + abs(m.yoy)) / 2
+        if typical_scale > 0 and abs(m.current) > 0:
+            if typical_scale / abs(m.current) > 15:
+                warnings.append(
+                    f"{m.name.upper()} current value ({m.current:,.2f}) is far smaller than "
+                    f"its own previous-quarter/YoY figures; a row number or formula reference "
+                    f"(e.g. '(1-2)') may have displaced the real column. Verify against the source page."
+                )
 
     if m.qoq_pct is not None and abs(m.qoq_pct) > 5000:
         warnings.append(
