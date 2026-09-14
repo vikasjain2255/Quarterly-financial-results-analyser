@@ -161,6 +161,15 @@ def numeric_candidates(token: str):
 
     results=[]
     for v in variants:
+        # A variant that still contains an unresolved letter means the OCR
+        # substitution pass didn't fully convert it to digits. Silently
+        # stripping that letter (as the old cleanup regex did) produces a
+        # shorter, wrong number instead of rejecting an invalid reading -
+        # e.g. "47,86l.15" would wrongly yield 4786.15 (missing a digit)
+        # alongside the correct, fully-substituted 47861.15. Only variants
+        # with every OCR-ambiguous character actually resolved are valid.
+        if re.search(r"[A-Za-z]", v):
+            continue
         # Remove OCR punctuation that is not useful.
         v=re.sub(r"[^0-9.\-]", "", v)
         if not v:
@@ -186,8 +195,14 @@ def numeric_candidates(token: str):
 
 
 def clean_numeric_token(token: str):
-    vals=numeric_candidates(token)
-    return vals[0] if len(vals)==1 else (vals[0] if vals else None)
+    vals = numeric_candidates(token)
+    if not vals:
+        return None
+    # With the stricter filtering above, ambiguity is now rare; when it
+    # does occur, prefer the largest fully-resolved reading rather than
+    # the smallest - a dropped/undercounted digit shrinks a number, it
+    # never inflates one.
+    return max(vals)
 
 
 def numeric_tokens(line: str) -> List[str]:
