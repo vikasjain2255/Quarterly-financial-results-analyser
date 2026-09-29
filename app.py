@@ -29,24 +29,6 @@ st.set_page_config(
 NUM_TOKEN = re.compile(r"^[\(\[\{]?[0-9OoIlLSsBbGgZzQq,\.\-]+[\)\]\}]?$")
 YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 
-SECTOR_PATTERNS = {
-    "BANK": [r"\bbank\b", r"\bbanking\b", r"\bcommercial\s+bank\b", r"\bprivate\s+sector\s+bank\b", r"\bpublic\s+sector\s+bank\b"],
-    "NBFC": [r"\bnon[\s-]?banking\s+financial\s+company\b", r"\bnon[\s-]?banking\s+finance\s+company\b", r"\bNBFC\b", r"\bhousing\s+finance\b"],
-}
-
-BANK_METRIC_PATTERNS = {
-    "nii": [r"\bnet\s+interest\s+income\b", r"\bnet\s+interest\s+revenue\b"],
-    "interest_earned": [r"\binterest\s+earned\b", r"\binterest\s+income\b"],
-    "interest_paid": [r"\binterest\s+(?:paid|expended)\b", r"\binterest\s+expense\b"],
-    "operating_profit": [r"\boperating\s+profit\b", r"\bpre[\s-]?provision\s+operating\s+profit\b", r"\bPPOP\b"],
-    "provisions": [r"\bprovisions?\b", r"\bprovisions?\s+and\s+contingencies\b"],
-    "net_profit_before_exceptional": [r"\bprofit\s+(?:for|from)\s+the\s+period\s+before\s+exceptional\b", r"\bnet\s+profit\b.*\bbefore\s+exceptional\b", r"\bprofit\s+before\s+exceptional\b"],
-    "gross_npa": [r"\bgross\s+NPA\b", r"\bgross\s+non[\s-]?performing\s+assets?\b"],
-    "gross_npa_pct": [r"\bgross\s+NPA\s+(?:ratio|%)", r"\bgross\s+NPA\s*%"],
-    "net_npa": [r"\bnet\s+NPA\b", r"\bnet\s+non[\s-]?performing\s+assets?\b"],
-    "net_npa_pct": [r"\bnet\s+NPA\s+(?:ratio|%)", r"\bnet\s+NPA\s*%"],
-}
-
 METRIC_PATTERNS = {
     "revenue": [
         r"revenue\s+from\s+operations",
@@ -234,21 +216,14 @@ def detect_company(doc):
 
 def statement_pages(doc, desired_basis: str, force_ocr=False):
     """
-    Identify the actual financial-results table.
+    Locate the actual financial-results table.
 
-    Normal rule:
-      * If the PDF explicitly identifies Standalone/Consolidated, respect it.
-
-    Fallback rule:
-      * If the PDF does NOT segregate the result table as standalone or
-        consolidated, analyse the strongest financial-results table found in
-        the PDF and mark the basis as NOT_SPECIFIED.
-      * This prevents the parser from failing on exchange filings where the
-        statement is simply titled "Statement of Financial Results" or
-        "Financial Results".
-      * Only the selected table and its immediately-contiguous continuation
-        pages are analysed; auditor/report/notes pages are not pulled in just
-        because they contain words such as revenue or profit.
+    Rules:
+    1. Respect an explicitly detected standalone/consolidated basis.
+    2. If the PDF's OCR/text extraction does not preserve the basis heading,
+       identify the strongest financial-results table and mark it NOT_SPECIFIED.
+    3. Do not mistake board letters, auditor reports, or explanatory notes for
+       the financial-results table.
     """
     candidates = []
     explicit_basis_found = False
@@ -257,156 +232,486 @@ def statement_pages(doc, desired_basis: str, force_ocr=False):
         t = page_text(page, force_ocr)
         low = re.sub(r"\s+", " ", t.lower())
 
+        # OCR in NSE/BSE PDFs can split words or corrupt punctuation, so use
+        # several tolerant forms instead of requiring the exact phrase.
         cons = bool(re.search(
-            r"(?:unaudited|audited)\s+consolidated\s+financial\s+results|"
-            r"consolidated\s+financial\s+results|"
-            r"consolidated\s+statement\s+of\s+financial\s+results",
-            low,
+            r"\bconsolidated\b.{0,60}\bfinancial\b.{0,30}\bresults?\b|"
+            r"\bconsolidated\b.{0,60}\bstatement\b.{0,30}\bfinancial\b",
+            low, re.I
         ))
         stand = bool(re.search(
-            r"(?:unaudited|audited)\s+standalone\s+financial\s+results|"
-            r"standalone\s+financial\s+results|"
-            r"standalone\s+statement\s+of\s+financial\s+results",
-            low,
+            r"\bstandalone\b.{0,60}\bfinancial\b.{0,30}\bresults?\b|"
+            r"\bstandalone\b.{0,60}\bstatement\b.{0,30}\bfinancial\b",
+            low, re.I
         ))
+
+        # Also catch the common board-letter wording, e.g.
+        # "Unaudited Standalone Financial Result of the Company".
+        if re.search(r"\bstandalone\b", low) and re.search(r"\bfinancial\s+result", low):
+            stand = True
+        if re.search(r"\bconsolidated\b", low) and re.search(r"\bfinancial\s+result", low):
+            cons = True
 
         if cons or stand:
             explicit_basis_found = True
 
-        corporate = bool(
-            re.search(r"revenue\s+from\s+operations|revenue\s+from\s+contracts|"
-                      r"total\s+income|statement\s+of\s+financial\s+results|"
-                      r"financial\s+results", low)
-            and
-            re.search(r"\bprofit\b|\bexpense\b|\btax\b|\bincome\b", low)
-        )
+        # Strong signals for the actual financial-results table.
+        table_signals = [
+            r"statement\s+of\s+financial\s+results?",
+            r"financial\s+results?\s+for\s+the\s+quarter",
+            r"particulars",
+            r"revenue\s+from\s+operations",
+            r"revenue\s+from\s+contracts",
+            r"total\s+income",
+            r"profit\s+before\s+tax",
+            r"profit\s+for\s+the\s+period",
+            r"profit\s+for\s+the\s+year",
+            r"net\s+interest\s+income",
+            r"operating\s+profit",
+            r"provisions",
+            r"gross\s+npa",
+            r"net\s+npa",
+        ]
+        signal_count = sum(bool(re.search(x, low, re.I)) for x in table_signals)
 
-        financial_sector = bool(
-            re.search(r"\binterest\s+(?:income|earned|expenses?|expended|paid)\b", low)
-            and re.search(r"\bnet\s+interest\s+income\b|\bnii\b", low, re.I)
-            and re.search(r"\boperating\s+profit\b|\bppop\b|pre[- ]provision", low, re.I)
-            and re.search(r"\bprovisions?\b", low)
-            and re.search(r"\bnet\s+profit\b|profit\s+after\s+tax", low)
-        )
+        # Require multiple table signals. This excludes auditor reports and
+        # the board covering letter, even though those may mention results.
+        has_results_table = signal_count >= 2 and bool(re.search(
+            r"quarter\s+ended|year\s+ended|particulars|revenue|interest\s+income|"
+            r"profit\s+before\s+tax|profit\s+for\s+the\s+period",
+            low, re.I
+        ))
 
-        # Score every plausible results table. This score is also used by the
-        # no-basis fallback, but explicit basis candidates remain preferred.
-        z = 0
-        for phrase, pts in [
-            ("statement of financial results", 140),
-            ("financial results", 120),
-            ("quarter ended", 100),
-            ("particulars", 80),
-            ("revenue from operations", 80),
-            ("total income", 50),
-            ("profit before tax", 60),
-            ("profit for the period", 50),
-            ("net interest income", 100),
-            ("operating profit", 70),
-            ("provisions", 50),
-            ("gross npa", 40),
-            ("net npa", 40),
-        ]:
-            if phrase in low:
-                z += pts
-        if re.search(r"june\s+30|march\s+31|september\s+30|december\s+31", low):
-            z += 25
-        if financial_sector:
-            z += 30
-        if corporate:
-            z += 20
-        if re.search(r"independent auditor|limited review report|chartered accountants", low):
-            z -= 250
-        if re.search(r"explanatory note|notes to the financial results", low):
-            z -= 100
+        bad_page = bool(re.search(
+            r"independent\s+auditor|auditor['’]?s\s+review\s+report|"
+            r"limited\s+review\s+report|chartered\s+accountants?|"
+            r"explanatory\s+note\s+to\s+the\s+statement|notes?\s+to\s+financial\s+results",
+            low, re.I
+        ))
 
-        kind = "FINANCIAL_SECTOR" if financial_sector else ("CORPORATE" if corporate else "OTHER")
-        if cons and corporate:
-            candidates.append(("CONSOLIDATED", i, t, kind, z + 500))
-        if stand and corporate:
-            candidates.append(("STANDALONE", i, t, kind, z + 500))
-        if financial_sector:
-            candidates.append(("CONSOLIDATED" if cons else ("STANDALONE" if stand else "NOT_SPECIFIED"), i, t, kind, z))
-        elif corporate:
-            candidates.append(("CONSOLIDATED" if cons else ("STANDALONE" if stand else "NOT_SPECIFIED"), i, t, kind, z))
+        if not has_results_table or bad_page:
+            continue
 
-    # First honour an explicitly requested basis where that basis exists.
+        score = signal_count * 20
+        score += 100 if re.search(r"statement\s+of\s+financial\s+results?", low, re.I) else 0
+        score += 80 if re.search(r"quarter\s+ended", low, re.I) else 0
+        score += 70 if re.search(r"particulars", low, re.I) else 0
+        score += 70 if re.search(r"revenue\s+from\s+operations|revenue\s+from\s+contracts", low, re.I) else 0
+        score += 50 if re.search(r"profit\s+before\s+tax", low, re.I) else 0
+        score += 40 if re.search(r"profit\s+for\s+the\s+period|profit\s+for\s+the\s+year", low, re.I) else 0
+
+        if cons:
+            candidates.append(("CONSOLIDATED", i, t, score + 500))
+        if stand:
+            candidates.append(("STANDALONE", i, t, score + 500))
+        if not cons and not stand:
+            candidates.append(("NOT_SPECIFIED", i, t, score))
+
+    # Requested basis takes precedence.
     if desired_basis == "CONSOLIDATED":
         pool = [x for x in candidates if x[0] == "CONSOLIDATED"]
+        if not pool:
+            # If no basis heading survived extraction, use the strongest table
+            # only when the document has no explicit basis anywhere.
+            if not explicit_basis_found:
+                pool = [x for x in candidates if x[0] == "NOT_SPECIFIED"]
+            if not pool:
+                raise ValueError("Requested consolidated statement could not be identified.")
     elif desired_basis == "STANDALONE":
         pool = [x for x in candidates if x[0] == "STANDALONE"]
+        if not pool:
+            if not explicit_basis_found:
+                pool = [x for x in candidates if x[0] == "NOT_SPECIFIED"]
+            if not pool:
+                raise ValueError("Requested standalone statement could not be identified.")
     else:
-        pool = [x for x in candidates if x[0] == "CONSOLIDATED"] or [x for x in candidates if x[0] == "STANDALONE"]
+        # AUTO: consolidated > standalone > unspecified table.
+        pool = [x for x in candidates if x[0] == "CONSOLIDATED"]
+        if not pool:
+            pool = [x for x in candidates if x[0] == "STANDALONE"]
+        if not pool:
+            pool = [x for x in candidates if x[0] == "NOT_SPECIFIED"]
+        if not pool:
+            raise ValueError("Could not identify a financial-results statement/table in this PDF.")
 
-    # If no explicit basis match exists AND the document itself contains no
-    # standalone/consolidated segregation, use the strongest table only.
-    if not pool and not explicit_basis_found:
-        fallback = [x for x in candidates if x[0] == "NOT_SPECIFIED"]
-        if fallback:
-            basis, start, t, kind, _ = max(fallback, key=lambda x: x[4])
-        else:
-            raise ValueError("Could not identify a financial-results table in the PDF.")
-    elif pool:
-        basis, start, t, kind, _ = max(pool, key=lambda x: x[4])
-    else:
-        raise ValueError("Requested standalone/consolidated statement could not be identified.")
+    basis, start, t, _ = max(pool, key=lambda x: x[3])
 
-    # Keep only the selected table and immediate continuation pages.
+    # Keep the selected table and only genuine continuation pages.
     pages = [start]
-    for j in range(start + 1, min(len(doc), start + 4)):
-        ll = page_text(doc[j], force_ocr).lower()
-        table_signal = sum(bool(re.search(p, ll, re.I)) for p in [
-            r"particulars", r"quarter ended", r"revenue", r"interest income",
-            r"net interest income", r"operating profit", r"provisions",
-            r"profit before tax", r"profit for the period", r"gross npa", r"net npa"
-        ])
-        bad_signal = bool(re.search(
-            r"independent auditor|limited review report|chartered accountants|"
-            r"explanatory note|notes to the financial results",
+    for j in range(start + 1, min(start + 5, len(doc))):
+        tt = page_text(doc[j], force_ocr)
+        ll = re.sub(r"\s+", " ", tt.lower())
+
+        if re.search(
+            r"independent\s+auditor|limited\s+review\s+report|chartered\s+accountants?|"
+            r"explanatory\s+note|notes?\s+to\s+financial\s+results|"
+            r"balance\s+sheet|cash\s+flow\s+statement|segment\s+(?:revenue|results)",
             ll, re.I
-        ))
-        if table_signal >= 2 and not bad_signal:
+        ):
+            break
+
+        continuation_signals = [
+            r"particulars", r"revenue", r"interest\s+income", r"net\s+interest\s+income",
+            r"operating\s+profit", r"provisions", r"profit\s+before\s+tax",
+            r"profit\s+for\s+the\s+period", r"gross\s+npa", r"net\s+npa",
+            r"earnings\s+per\s+share"
+        ]
+        if sum(bool(re.search(x, ll, re.I)) for x in continuation_signals) >= 2:
             pages.append(j)
         else:
             break
 
     return basis, pages
 
-def detect_sector(doc, pages, force_ocr=False):
-    corpus = "\n".join(page_text(doc[p], force_ocr) for p in pages[:3])
-    nbfc = len(re.findall(r"\b(?:NBFC|non[\s-]?banking\s+financial\s+company|non[\s-]?banking\s+finance\s+company|housing\s+finance)\b", corpus, re.I))
-    bank = len(re.findall(r"\b(?:bank|banking|CASA|CRR|SLR)\b", corpus, re.I))
-    if nbfc >= 1 and nbfc >= bank:
-        return "NBFC"
-    if bank >= 2:
-        return "BANK"
-    return "MANUFACTURING"
+def detect_unit(text: str):
+    low = text.lower()
+    if re.search(r"\(\s*['₹]?\s*in\s+lakhs?\s*\)", low) or re.search(r"in lakhs", low):
+        return 0.01, "₹ crore (converted from lakhs)"
+    if re.search(r"in\s+millions?", low):
+        return 0.10, "₹ crore (converted from millions)"
+    if re.search(r"in\s+thousands?", low):
+        return 0.0001, "₹ crore (converted from thousands)"
+    return 1.0, "₹ crore"
 
-def extract_financial_sector_metric(rows, metric, factor=1.0, percent=False):
-    pats = BANK_METRIC_PATTERNS.get(metric, [])
-    candidates=[]
-    for r in rows:
-        label=r.get("text", "")
-        if not any(re.search(p,label,re.I) for p in pats):
+
+def find_header(lines):
+    """
+    Identify the declared four financial periods.
+    This is informational; the numerical order is the order printed in
+    the statement, not inferred from magnitudes.
+    """
+    for i, line in enumerate(lines):
+        if YEAR_RE.search(line) and (
+            "quarter" in line.lower()
+            or "year ended" in line.lower()
+            or "particulars" in line.lower()
+        ):
+            return i
+    return None
+
+
+def line_has_metric(line, metric):
+    low = re.sub(r"\s+", " ", line.strip().lower())
+    for p in METRIC_PATTERNS[metric]:
+        if re.search(p, low):
+            return True
+    return False
+
+
+def is_numeric_only(line):
+    toks = numeric_tokens(line)
+    stripped = line.strip()
+    if not toks:
+        return False
+    # A numeric-only row should contain no alphabetic words.
+    letters = re.sub(r"[\d\s,().\-\[\]{}.|]", "", stripped)
+    return len(letters) == 0
+
+
+def collect_row(lines, idx, max_forward=8):
+    """
+    Financial PDFs frequently extract a row label on one line and the four
+    numbers on the following lines. Collect numeric values without allowing
+    later unrelated rows to leak in.
+    """
+    label = lines[idx].strip()
+    vals = numeric_tokens(label)
+
+    # If the label line already contains all four numbers, use them.
+    if len(vals) >= 4:
+        return vals[:4], label
+
+    collected = list(vals)
+
+    for j in range(idx + 1, min(idx + 1 + max_forward, len(lines))):
+        nxt = lines[j].strip()
+
+        # Stop at a new textual row/section.
+        if not nxt:
             continue
-        nums=sorted([n for n in r.get("numbers",[]) if n["x"]>300], key=lambda n:n["x"])
-        if len(nums)>=3:
-            vals=[n["value"] for n in nums[:4]]
-            if not percent: vals=[v*factor for v in vals]
-            candidates.append((vals,label,[n["token"] for n in nums[:4]],r["page"]))
-    if not candidates: return Metric(name=metric)
-    vals,label,raw,page=candidates[0]
-    vals=vals[:3]
-    return Metric(name=metric,current=vals[0],previous_q=vals[1],yoy=vals[2],qoq_pct=pct_change(vals[0],vals[1]),yoy_pct=pct_change(vals[0],vals[2]),confidence="HIGH",source=label,raw=raw)
 
-def derive_nii_from_interest(metrics):
-    a=metrics.get("interest_earned"); b=metrics.get("interest_paid")
-    if not a or not b or a.current is None or b.current is None: return Metric(name="nii")
-    vals=[]
-    for x,y in zip((a.current,a.previous_q,a.yoy),(b.current,b.previous_q,b.yoy)):
-        vals.append(x-y if x is not None and y is not None else None)
-    if any(v is None for v in vals): return Metric(name="nii")
-    return Metric(name="nii",current=vals[0],previous_q=vals[1],yoy=vals[2],qoq_pct=pct_change(vals[0],vals[1]),yoy_pct=pct_change(vals[0],vals[2]),confidence="DERIVED",source="Interest earned - Interest paid",raw=[])
+        nums = numeric_tokens(nxt)
+
+        if nums and is_numeric_only(nxt):
+            collected.extend(nums)
+            if len(collected) >= 4:
+                return collected[:4], label
+            continue
+
+        # Some PDF extractors put label fragments before the numbers.
+        # Permit short continuation fragments only if they contain no
+        # financial-row keywords and no more than a few characters.
+        if not nums and len(nxt) < 35 and not re.search(
+            r"revenue|income|expense|profit|loss|tax|finance|depreciation|"
+            r"materials|employee|purchase|inventory|other|total|particulars|"
+            r"share|earnings|comprehensive|exceptional",
+            nxt,
+            re.I,
+        ):
+            continue
+
+        break
+
+    return (collected[:4] if len(collected) >= 4 else collected), label
+
+
+
+def merge_numeric_items(items):
+    """
+    Merge adjacent OCR fragments such as:
+      71 + S7 -> 71S7
+      1?R + 15 -> 1?R15
+    Only merge fragments that are very close horizontally.
+    """
+    out=[]
+    i=0
+    while i<len(items):
+        cur=items[i]
+        if i+1<len(items):
+            nxt=items[i+1]
+            gap=nxt["x"]-cur["x1"]
+            if gap<=3.5 and (
+                NUM_TOKEN.fullmatch(cur["text"].strip(",:;"))
+                or re.search(r"\d",cur["text"])
+            ) and (
+                NUM_TOKEN.fullmatch(nxt["text"].strip(",:;"))
+                or re.search(r"\d",nxt["text"])
+            ):
+                cur={"x":cur["x"],"x1":nxt["x1"],
+                     "text":cur["text"]+nxt["text"]}
+                i+=1
+        out.append(cur)
+        i+=1
+    return out
+
+
+def choose_row_values(tokens):
+    """
+    Pick four values from OCR candidates using financial-table constraints.
+    The first three are current quarter / previous quarter / YoY quarter;
+    the fourth is FY and may be several times larger.
+    """
+    candidate_lists=[numeric_candidates(t) for t in tokens]
+    if len(candidate_lists)<4:
+        return None
+
+    # Keep the first four visual financial columns.
+    candidate_lists=candidate_lists[:4]
+    best=None
+
+    import itertools
+    for combo in itertools.product(*candidate_lists):
+        if len(combo)!=4:
+            continue
+        a,b,c,d=combo
+        if any(abs(x)>1e10 for x in combo):
+            continue
+        # The first three periods should normally be in the same order of
+        # magnitude. Allow extreme business moves, but strongly penalise
+        # impossible 10x/0.1x OCR interpretations.
+        score=0.0
+        for x,y in [(a,b),(a,c),(b,c)]:
+            if x==0 or y==0:
+                continue
+            ratio=max(abs(x/y),abs(y/x))
+            if ratio>12:
+                score-=50
+            else:
+                score-=abs(__import__("math").log10(ratio))*5
+
+        # FY is cumulative and can legitimately be larger than Q1.
+        if a!=0 and d!=0:
+            ratio=abs(d/a)
+            if ratio<0.25 or ratio>20:
+                score-=30
+
+        # Prefer values with two decimals.
+        for x in combo:
+            if abs(x-round(x,2))<1e-9:
+                score+=1
+
+        if best is None or score>best[0]:
+            best=(score,list(combo))
+    return best[1] if best else None
+
+
+def page_rows(doc, pages, force_ocr=False):
+    """
+    Reconstruct visual table rows from PDF word coordinates.
+    This is critical for NSE PDFs where text extraction is column-major:
+    labels may be emitted first and the four numerical columns afterwards.
+    """
+    rows = []
+    for pno in pages:
+        page = doc[pno]
+        try:
+            if force_ocr:
+                tp = page.get_textpage_ocr()
+                words = page.get_text("words", textpage=tp, sort=True)
+            else:
+                words = page.get_text("words", sort=True)
+        except Exception:
+            words = page.get_text("words", sort=True)
+
+        grouped = []
+        for w in words:
+            x0, y0, x1, y1, txt = w[:5]
+            cy = (y0 + y1) / 2
+            target = None
+            for g in grouped:
+                if abs(g["y"] - cy) <= 3.2:
+                    target = g
+                    break
+            item = {"x": float(x0), "x1": float(x1), "text": str(txt)}
+            if target is None:
+                grouped.append({"y": cy, "items": [item]})
+            else:
+                target["items"].append(item)
+                target["y"] = (target["y"] + cy) / 2
+
+        for g in grouped:
+            g["items"].sort(key=lambda z: z["x"])
+            g["items"] = merge_numeric_items(g["items"])
+            g["text"] = " ".join(x["text"] for x in g["items"])
+            g["numbers"] = []
+
+            # Financial columns start well to the right of the particulars
+            # column in NSE result tables.
+            financial_items=[x for x in g["items"] if x["x"]>300]
+            token_text=[x["text"] for x in financial_items]
+            chosen=choose_row_values(token_text) if len(token_text)>=4 else None
+
+            if chosen is not None:
+                for x,v in zip(financial_items[:4],chosen):
+                    if not (1900 <= v <= 2100):
+                        g["numbers"].append({
+                            "value": v,
+                            "x": x["x"],
+                            "token": x["text"],
+                        })
+            else:
+                for x in financial_items:
+                    vals=numeric_candidates(x["text"])
+                    if vals:
+                        v=vals[0]
+                        if not (1900 <= v <= 2100):
+                            g["numbers"].append({
+                                "value": v,
+                                "x": x["x"],
+                                "token": x["text"],
+                            })
+            g["page"] = pno + 1
+            rows.append(g)
+
+    return sorted(rows, key=lambda r: (r["page"], r["y"]))
+
+
+def extract_pat_owner(rows):
+    """Pick the Owners row immediately associated with 'Profit attributable to'."""
+    anchor_indices=[]
+    for i,r in enumerate(rows):
+        if re.search(r"profit\s+attributable\s+to", r["text"], re.I):
+            anchor_indices.append(i)
+    candidates=[]
+    for ai in anchor_indices:
+        for j in range(ai+1, min(ai+6, len(rows))):
+            r=rows[j]
+            if re.search(r"owners\s+of\s*the\s+compan", r["text"], re.I):
+                nums=[n for n in r["numbers"] if n["x"]>300]
+                if len(nums)>=4:
+                    candidates.append((j-ai, [n["value"] for n in nums[:4]], r["text"], [n["token"] for n in nums[:4]]))
+                break
+    if not candidates:
+        return None
+    _,vals,label,raw=min(candidates,key=lambda x:x[0])
+    return vals,label,raw
+
+def extract_metric_rows(rows, metric):
+    """
+    Primary extraction path. Match the metric label to the SAME VISUAL ROW
+    as its four numeric values. This prevents cross-row mixing of:
+      Revenue from Operations / Other Operating Revenue / Total Revenue.
+    """
+    candidates = []
+
+    for r in rows:
+        low = re.sub(r"\s+", " ", r["text"].strip().lower())
+        if not any(re.search(p, low) for p in METRIC_PATTERNS[metric]):
+            continue
+
+        nums = sorted(r["numbers"], key=lambda x: x["x"])
+
+        # Financial statement rows normally have exactly four period values.
+        # If there are more, take the four right-most/most plausible values.
+        if len(nums) >= 4:
+            # The financial columns in these NSE statements are to the right
+            # of the Particulars column. Ignore tiny left-side numbering.
+            nums = [n for n in nums if n["x"] > 300]
+            if len(nums) >= 4:
+                nums = nums[:4]
+                vals = [n["value"] for n in nums]
+                candidates.append((vals, r["text"], [n["token"] for n in nums], r["page"]))
+
+    if not candidates:
+        return None
+
+    def score(c):
+        label = c[1].lower()
+        score = 0
+        exact = {
+            "revenue": ["revenue from operations"],
+            "other_income": ["other income"],
+            "finance_cost": ["finance costs"],
+            "depreciation": ["depreciation and amortisation", "depreciation / amortisation"],
+            "pbt": ["profit before tax"],
+            "pat_total": ["profit for the period", "profit/(loss) after tax"],
+            "pat_owner": ["owners ofthe company", "owners of the company"],
+            "ebitda": ["ebitda"],
+        }
+        for phrase in exact.get(metric, []):
+            if phrase in label:
+                score += 50
+        if "segment" in label:
+            score -= 100
+        if "earnings per share" in label or "eps" in label:
+            score -= 100
+        return score
+
+    return max(candidates, key=score)
+
+
+def extract_metric(lines, metric):
+    candidates = []
+
+    for i, line in enumerate(lines):
+        if not line_has_metric(line, metric):
+            continue
+
+        vals, label = collect_row(lines, i)
+        if len(vals) >= 4:
+            parsed = [clean_numeric_token(x) for x in vals[:4]]
+            if all(x is not None for x in parsed):
+                candidates.append((parsed, label, vals))
+
+    if not candidates:
+        return None
+
+    # Prefer the most exact label and avoid a segment/notes row.
+    def score(c):
+        vals, label, raw = c
+        s = 0
+        if "revenue from operations" in label.lower(): s += 30
+        if "profit before tax" in label.lower(): s += 30
+        if "profit for the period" in label.lower(): s += 30
+        if "finance costs" in label.lower(): s += 30
+        if "depreciation" in label.lower(): s += 30
+        if "other income" in label.lower(): s += 30
+        if "segment" in label.lower(): s -= 100
+        if "eps" in label.lower(): s -= 100
+        return s
+
+    return max(candidates, key=score)
+
 
 def make_metric(name, extracted, factor):
     if not extracted:
@@ -497,7 +802,6 @@ def analyse(data, basis, quarter, force_ocr):
     company = detect_company(doc)
 
     selected_basis, pages = statement_pages(doc, basis, force_ocr)
-    sector = detect_sector(doc, pages, force_ocr)
     # The statement page is the authoritative company-name source.
     statement_head = page_text(doc[pages[0]], force_ocr).splitlines()
     for line in statement_head[:12]:
@@ -526,36 +830,37 @@ def analyse(data, basis, quarter, force_ocr):
     visual_rows = page_rows(doc, pages, force_ocr)
 
     metrics = {}
-
-    if sector in {"BANK", "NBFC"}:
-        for k in ["interest_earned","interest_paid","operating_profit","provisions","net_profit_before_exceptional","gross_npa","net_npa"]:
-            metrics[k] = extract_financial_sector_metric(visual_rows, k, unit_factor, percent=False)
-        metrics["gross_npa_pct"] = extract_financial_sector_metric(visual_rows, "gross_npa_pct", 1.0, percent=True)
-        metrics["net_npa_pct"] = extract_financial_sector_metric(visual_rows, "net_npa_pct", 1.0, percent=True)
-        metrics["nii"] = derive_nii_from_interest(metrics)
-        explicit = extract_financial_sector_metric(visual_rows, "nii", unit_factor, percent=False)
-        if explicit.current is not None:
-            metrics["nii"] = explicit
-        # aliases used by downstream rendering
-        metrics["operating_profit"].name="operating_profit"
-        metrics["provisions"].name="provisions"
-        metrics["net_profit_before_exceptional"].name="net_profit_before_exceptional"
-    else:
-        for k in ["revenue", "other_income", "finance_cost", "depreciation", "pbt"]:
-            ex = extract_metric_rows(visual_rows, k)
-            metrics[k] = make_metric(k, ex, unit_factor) if ex is not None else make_metric(k, extract_metric(all_lines, k), unit_factor)
-        if selected_basis == "CONSOLIDATED":
-            owner0 = extract_pat_owner(visual_rows)
-            if owner0:
-                metrics["pat"] = make_metric("pat", owner0, unit_factor)
-            else:
-                ex=extract_metric_rows(visual_rows,"pat_total")
-                metrics["pat"]=make_metric("pat",ex if ex else extract_metric(all_lines,"pat_total"),unit_factor)
+    for k in ["revenue", "other_income", "finance_cost", "depreciation", "pbt"]:
+        ex = extract_metric_rows(visual_rows, k)
+        if ex is not None:
+            metrics[k] = make_metric(k, ex, unit_factor)
         else:
-            ex=extract_metric_rows(visual_rows,"pat_total")
-            metrics["pat"]=make_metric("pat",ex if ex else extract_metric(all_lines,"pat_total"),unit_factor)
-        explicit=extract_metric_rows(visual_rows,"ebitda") or extract_metric(all_lines,"ebitda")
-        metrics["ebitda"]=make_metric("ebitda",explicit,unit_factor) if explicit else derive_ebitda(metrics)
+            metrics[k] = make_metric(k, extract_metric(all_lines, k), unit_factor)
+
+    # Prefer consolidated "profit attributable to owners" for CONSOLIDATED.
+    if selected_basis == "CONSOLIDATED":
+        owner0 = extract_pat_owner(visual_rows)
+        owner = owner0
+        if owner:
+            metrics["pat"] = make_metric("pat", owner, unit_factor)
+        else:
+            ex = extract_metric_rows(visual_rows, "pat_total")
+            metrics["pat"] = make_metric(
+                "pat", ex if ex else extract_metric(all_lines, "pat_total"), unit_factor
+            )
+    else:
+        ex = extract_metric_rows(visual_rows, "pat_total")
+        metrics["pat"] = make_metric(
+            "pat", ex if ex else extract_metric(all_lines, "pat_total"), unit_factor
+        )
+
+    explicit = extract_metric_rows(visual_rows, "ebitda")
+    if explicit is None:
+        explicit = extract_metric(all_lines, "ebitda")
+    if explicit:
+        metrics["ebitda"] = make_metric("ebitda", explicit, unit_factor)
+    else:
+        metrics["ebitda"] = derive_ebitda(metrics)
 
     revenue = metrics["revenue"]
     ebitda = metrics["ebitda"]
@@ -604,7 +909,6 @@ def analyse(data, basis, quarter, force_ocr):
         "company": company,
         "quarter": quarter,
         "basis": selected_basis,
-        "sector": sector,
         "unit": unit_name,
         "pages": [p + 1 for p in pages],
         "revenue": asdict(revenue),
@@ -652,29 +956,24 @@ def result_line(name, m):
 
 
 def render_summary(r):
-    company = re.sub(r"\s+(LIMITED|LTD\.?|PRIVATE LIMITED|PVT\. LTD\.?)$", "", r["company"], flags=re.I).strip().upper()
-    if r.get("sector") in {"BANK", "NBFC"}:
-        def line(label,key,percent=False):
-            m=r.get(key,{})
-            v=m.get("current")
-            if v is None: return f"{label} NA"
-            unit="%" if percent else " CR"
-            return f"{label} {v:,.2f}{unit} | QoQ {pct_text(m.get('qoq_pct'))} | YoY {pct_text(m.get('yoy_pct'))}"
-        return "\n\n".join([
-            f"{company} {r['quarter']} ({r['sector']}) :",
-            line("NII","nii"),
-            line("OPERATING PROFIT / PPOP","operating_profit"),
-            line("PROVISIONS","provisions"),
-            line("NET PROFIT BEFORE EXCEPTIONAL","net_profit_before_exceptional"),
-            line("GROSS NPA","gross_npa"),
-            line("GROSS NPA %","gross_npa_pct",True),
-            line("NET NPA","net_npa"),
-            line("NET NPA %","net_npa_pct",True),
-        ])
-    margin="NA" if r["margin_current"] is None else f"{r['margin_current']:.1f}%"
-    yoy_margin="NA" if r["margin_yoy"] is None else f"{r['margin_yoy']:.1f}%"
-    qoq_margin="NA" if r["margin_previous_q"] is None else f"{r['margin_previous_q']:.1f}%"
-    return "\n\n".join([f"{company} {r['quarter']} :",result_line("REVENUE",r["revenue"]),result_line("EBITDA",r["ebitda"]),f"MARGINS {margin} V {yoy_margin} (YOY), {qoq_margin} (QOQ)",result_line("CONS NET PROFIT",r["pat"])])
+    company = re.sub(
+        r"\s+(LIMITED|LTD\.?|PRIVATE LIMITED|PVT\. LTD\.?)$",
+        "",
+        r["company"],
+        flags=re.I,
+    ).strip().upper()
+
+    margin = "NA" if r["margin_current"] is None else f"{r['margin_current']:.1f}%"
+    yoy_margin = "NA" if r["margin_yoy"] is None else f"{r['margin_yoy']:.1f}%"
+    qoq_margin = "NA" if r["margin_previous_q"] is None else f"{r['margin_previous_q']:.1f}%"
+
+    return "\n\n".join([
+        f"{company} {r['quarter']} :",
+        result_line("REVENUE", r["revenue"]),
+        result_line("EBITDA", r["ebitda"]),
+        f"MARGINS {margin} V {yoy_margin} (YOY), {qoq_margin} (QOQ)",
+        result_line("CONS NET PROFIT", r["pat"]),
+    ])
 
 
 # ============================================================
@@ -718,7 +1017,7 @@ if st.button("ANALYSE", type="primary", width="stretch"):
         r = analyse(data, basis, quarter, force_ocr)
 
         st.success(
-            f"Selected {r['sector']} • {r['basis']} statement • PDF pages {r['pages'][0]}–{r['pages'][-1]} "
+            f"Selected {r['basis']} statement • PDF pages {r['pages'][0]}–{r['pages'][-1]} "
             f"• {r['unit']}"
         )
 
