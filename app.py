@@ -723,9 +723,9 @@ def make_metric(name, extracted, factor):
         vals, label, raw = extracted
     vals = [x * factor for x in vals]
 
-    # Statement order is:
-    # current quarter, previous quarter, corresponding previous-year quarter,
-    # previous financial year.
+    # Financial-result tables usually print the latest quarter first, followed
+    # by the previous quarter, corresponding year-ago quarter, and FY total.
+    # Treat the first reported period as the latest quarter; never hard-code Q1.
     cur, prev_q, yoy = vals[:3]
 
     return Metric(
@@ -981,11 +981,16 @@ def render_summary(r):
 # ============================================================
 
 st.title("📊 Quarterly Financial Results Analyser")
-st.caption("Final build — statement-first extraction, strict basis locking, OCR-safe parsing")
+st.caption("Final build — latest-quarter-first extraction, statement-first basis detection, OCR-safe parsing")
 
 with st.sidebar:
     st.header("Analysis settings")
-    quarter = st.selectbox("Quarter", ["Q1", "Q2", "Q3", "Q4"], index=0)
+    quarter = st.selectbox(
+        "Quarter to analyse",
+        ["LATEST QUARTER (AUTO)", "Q1", "Q2", "Q3", "Q4"],
+        index=0,
+        help="AUTO uses the first/current quarter column in the selected financial-results table. Choose Q1–Q4 only to label a known period manually.",
+    )
     basis = st.radio(
         "Results basis",
         ["AUTO", "CONSOLIDATED", "STANDALONE"],
@@ -1014,7 +1019,11 @@ if st.button("ANALYSE", type="primary", width="stretch"):
             st.error("Please paste a direct PDF link or upload a PDF.")
             st.stop()
 
-        r = analyse(data, basis, quarter, force_ocr)
+        # AUTO is the default so a PDF for any reporting quarter is not labelled
+        # Q1 merely because the app was opened. Values are taken from the latest
+        # quarter column printed first in the selected financial-results table.
+        analysis_quarter = "Latest quarter" if quarter == "LATEST QUARTER (AUTO)" else quarter
+        r = analyse(data, basis, analysis_quarter, force_ocr)
 
         st.success(
             f"Selected {r['basis']} statement • PDF pages {r['pages'][0]}–{r['pages'][-1]} "
