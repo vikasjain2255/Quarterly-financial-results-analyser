@@ -57,6 +57,12 @@ METRIC_PATTERNS = {
         r"profit\s*/?\s*\(?loss\)?\s+after\s+tax",
         r"profit\s+for\s+t\s*he\s+period",
         r"profit\s*/?\s*\(?loss\)?\s+for\s+the\s+period",
+        r"net\s+profit\s*/?\s*\(?loss\)?",
+        r"net\s+income",
+        r"profit\s+after\s+tax",
+        r"profit\s*/?\s*\(?loss\)?\s+for\s+the\s+year",
+        r"profit\s+for\s+the\s+period\s+after\s+tax",
+        r"net\s+profit\s+for\s+the\s+period",
     ],
     "pat_owner": [
         r"profit\s+attributable\s+to\s*:?$",
@@ -214,6 +220,37 @@ def detect_company(doc):
     return "COMPANY"
 
 
+def latest_period_date_score(text):
+    """Score a results page by the newest explicit reporting date it contains.
+
+    A September 2026 statement should outrank an older June 2026 table when a
+    filing/PDF contains more than one results table. This score is used only
+    after a page has already passed the financial-results-table checks.
+    """
+    dates = []
+    # Numeric formats: 30-09-2026, 30/09/2026, 30.09.2026
+    for m in re.finditer(r"\b(\d{1,2})[./-](\d{1,2})[./-]((?:19|20)\d{2})\b", text):
+        day, month, year = map(int, m.groups())
+        if (month, day) in {(3, 31), (6, 30), (9, 30), (12, 31)}:
+            dates.append((year, month, day))
+    # Month-name formats: September 30, 2026 / 30 September 2026
+    months = {name.lower(): i for i, name in enumerate(
+        ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"], 1)}
+    for m in re.finditer(r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+((?:19|20)\d{2})\b", text, re.I):
+        y, mo, day = int(m.group(3)), months[m.group(1).lower()], int(m.group(2))
+        if (mo, day) in {(3, 31), (6, 30), (9, 30), (12, 31)}:
+            dates.append((y, mo, day))
+    for m in re.finditer(r"\b(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+((?:19|20)\d{2})\b", text, re.I):
+        y, mo, day = int(m.group(3)), months[m.group(2).lower()], int(m.group(1))
+        if (mo, day) in {(3, 31), (6, 30), (9, 30), (12, 31)}:
+            dates.append((y, mo, day))
+    if not dates:
+        return 0
+    # Weight each later quarter-end date enough to outrank an older table.
+    y, m, d = max(dates)
+    return (y * 12 + m) * 10 + d / 31.0
+
+
 def statement_pages(doc, desired_basis: str, force_ocr=False):
     """
     Locate the actual financial-results table.
@@ -298,7 +335,10 @@ def statement_pages(doc, desired_basis: str, force_ocr=False):
         score += 70 if re.search(r"particulars", low, re.I) else 0
         score += 70 if re.search(r"revenue\s+from\s+operations|revenue\s+from\s+contracts", low, re.I) else 0
         score += 50 if re.search(r"profit\s+before\s+tax", low, re.I) else 0
-        score += 40 if re.search(r"profit\s+for\s+the\s+period|profit\s+for\s+the\s+year", low, re.I) else 0
+        score += 40 if re.search(r"profit\s+for\s+the\s+period|profit\s+for\s+the\s+year|net\s+profit|net\s+income", low, re.I) else 0
+        # Prefer the table carrying the most recent reporting date, rather
+        # than a stale quarter table embedded in the same PDF.
+        score += latest_period_date_score(t)
 
         if cons:
             candidates.append(("CONSOLIDATED", i, t, score + 500))
@@ -673,7 +713,9 @@ def extract_metric_rows(rows, metric):
                 score += 50
         if "segment" in label:
             score -= 100
-        if "earnings per share" in label or "eps" in label:
+        if "earnings per share" in label or re.search(r"\beps\b", label):
+            score -= 100
+        if "comprehensive income" in label and metric == "pat_total":
             score -= 100
         return score
 
@@ -703,6 +745,8 @@ def extract_metric(lines, metric):
         if "revenue from operations" in label.lower(): s += 30
         if "profit before tax" in label.lower(): s += 30
         if "profit for the period" in label.lower(): s += 30
+        if "net profit" in label.lower() or "net income" in label.lower(): s += 35
+        if "profit after tax" in label.lower() or "after tax" in label.lower(): s += 25
         if "finance costs" in label.lower(): s += 30
         if "depreciation" in label.lower(): s += 30
         if "other income" in label.lower(): s += 30
